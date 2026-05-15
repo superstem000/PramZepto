@@ -108,12 +108,13 @@ SEARCH_PROFILES = {
     },
 }
 
-# Calibration full AF: replaces stage 1 with a wide sweep from Z=100 to Z=200
-# (center=150, range=±50, step=1.5), then runs the same finer stages as
-# the regular SEARCH_PROFILES for mres=32.
+# Calibration full AF: replaces stage 1 with a wide fine sweep from Z=100 to
+# Z=200 (center=150, range=±50, step=0.5), then a single fine polish stage
+# (the finest stage from the regular SEARCH_PROFILES for mres=32). The fine
+# step keeps the coarse sweep from skipping the target feature's focus peak.
 CALIBRATION_AF_STAGE1_CENTER_FS = 150.0
 CALIBRATION_AF_STAGE1_RANGE_FS  = 50.0    # ± from center -> 100..200
-CALIBRATION_AF_STAGE1_STEP_FS   = 1.5
+CALIBRATION_AF_STAGE1_STEP_FS   = 0.5
 
 # Quick focus profiles
 QUICK_PROFILES = {
@@ -347,8 +348,8 @@ class AutoFocusController(QObject):
         """Start a calibration-style full AF.
 
         Phase 1 is replaced with a wide sweep from Z=100 to Z=200 (center 150,
-        range ±50, step 1.5fs). Subsequent stages are the same finer sweeps
-        used by the regular full AF for mres=32. On success the resulting
+        range ±50, step 0.5fs). Phase 2 is a single fine polish stage (the
+        finest stage from the regular full AF for mres=32). On success the resulting
         best Z is persisted to calibration.json under 'known_focus_fs' and
         the module-level KNOWN_FOCUS_FULLSTEP is updated so subsequent
         regular AF runs use it as their center.
@@ -372,12 +373,12 @@ class AutoFocusController(QObject):
         except Exception:
             pass
 
-        # Phase 1: wide 100..200 sweep at 1.5fs steps.
-        # Phases 2/3: keep the finer stages from the mres=32 profile so we
-        # end up at sub-full-step accuracy.
-        finer_stages = SEARCH_PROFILES.get(self._mres, SEARCH_PROFILES[32])["stages"][1:]
+        # Phase 1: wide 100..200 cold sweep at fine 0.5fs steps.
+        # Phase 2: single fine polish stage (finest from the mres=32 profile)
+        # re-centred on the best Z, for sub-full-step accuracy.
+        finer_stages = SEARCH_PROFILES.get(self._mres, SEARCH_PROFILES[32])["stages"][-1:]
         if not finer_stages:
-            finer_stages = SEARCH_PROFILES[32]["stages"][1:]
+            finer_stages = SEARCH_PROFILES[32]["stages"][-1:]
 
         self._stages = [
             {"range": CALIBRATION_AF_STAGE1_RANGE_FS,
