@@ -1,9 +1,10 @@
 """
 Record Setup Screen - Configure recording parameters before starting.
 
-This screen now mirrors FreeModeScreen's camera/calibration setup so that the
+This screen mirrors FreeModeScreen's camera/calibration setup so that the
 move planner's microfluidics recipe can run orientation calibration during
-its 1-hour wait between pushes.
+its 1-hour wait between pushes, and spiral_scan recipe steps can drive the
+shared SpiralScanController.
 
 Layout:
   - LEFT panel:  live camera preview (CameraPreviewWidget)
@@ -12,12 +13,16 @@ Layout:
                  free mode), plus a Start Recording button at the bottom.
 
 Calibration / autofocus / spiral scan controllers are wired up the same way
-FreeModeScreen wires them, so the Calibrate Stage / Auto Focus / Spiral Scan
-buttons on the shared stepper widget all work here too.
+FreeModeScreen wires them.
 
-The move planner is given a reference to the OrientCalibrationController and
-a callable for the current camera settings, so it can fire calibration during
-the microfluidics 1-hour dwell.
+The move planner is given references to:
+  - the OrientCalibrationController (for calibration-during-dwell), plus a
+    callable for the current camera settings, so it can fire calibration
+    during the microfluidics 1-hour dwell.
+  - the SpiralScanController (for spiral_scan steps), plus a callable that
+    returns the current scan settings (interval, center_col, center_row)
+    from the shared stepper widget's UI — same source the Spiral Scan
+    button uses.
 """
 
 from PyQt6.QtWidgets import (
@@ -53,7 +58,7 @@ class RecordSetupScreen(QWidget):
         self._init_autofocus()
         self._init_calibration()
         self._init_spiral_scan()
-        self._wire_planner_to_calibration()
+        self._wire_planner_to_controllers()
 
     # ──────────────────────────────────────────────────────────────
     # UI
@@ -223,6 +228,7 @@ class RecordSetupScreen(QWidget):
             camera_preview=self.camera_preview,
             mc=self.mc,
             motors_config=sw.MOTORS,
+            config=self.config,
             parent=self
         )
         self._af_controller.progress.connect(self._on_af_progress)
@@ -390,8 +396,7 @@ class RecordSetupScreen(QWidget):
                 QMessageBox.warning(self, "Calibration", message)
 
     # ──────────────────────────────────────────────────────────────
-    # Spiral Scan (mirrors FreeModeScreen — kept for completeness even
-    # though the planner doesn't call it yet)
+    # Spiral Scan (mirrors FreeModeScreen)
     # ──────────────────────────────────────────────────────────────
     def _init_spiral_scan(self):
         sw = self.shared_stepper_widget
@@ -452,22 +457,32 @@ class RecordSetupScreen(QWidget):
             self._camera_controls.set_status(f"Scan error: {message}")
 
     # ──────────────────────────────────────────────────────────────
-    # Wire planner ↔ calibration so the microfluidics 1-hour dwell
-    # can fire orient_cal in parallel.
+    # Wire planner ↔ controllers
+    #   * orient_cal for calibration-during-dwell
+    #   * spiral_scan for spiral_scan recipe steps
     # ──────────────────────────────────────────────────────────────
-    def _wire_planner_to_calibration(self):
-        """Give the move planner a handle on the cal controller and a way to
-        fetch current camera settings. Also intercept the Run Recipe button
-        so we can pre-flight: live preview must be on if the recipe will try
-        to calibrate during a dwell."""
+    def _wire_planner_to_controllers(self):
+        """Give the move planner handles on the cal & spiral-scan controllers
+        plus a way to fetch current camera settings and current scan settings.
+        Also intercept the Run Recipe button so we can pre-flight: live preview
+        must be on if the recipe will try to calibrate during a dwell, or if it
+        contains a spiral_scan step."""
         self._move_planner.set_orient_cal_controller(self._orient_cal)
         self._move_planner.set_camera_settings_provider(
             self._camera_controls.get_camera_settings
         )
+        # Spiral scan wiring — mirror what the stepper widget's Spiral Scan
+        # button does: configure with (interval, center_col, center_row) from
+        # the stepper widget's scan settings UI, then start.
+        self._move_planner.set_spiral_scan_controller(self._spiral_scan)
+        self._move_planner.set_spiral_scan_settings_provider(
+            self._get_spiral_scan_settings
+        )
 
-        # Pre-flight check: if the recipe needs calibration, refuse Run
-        # unless live preview is on. We do this by replacing the existing
-        # click handler on btn_execute.
+        # Pre-flight check: if the recipe needs calibration or contains a
+        # spiral_scan step, refuse Run unless live preview is on (and stage
+        # is calibrated, for spiral_scan). We do this by replacing the
+        # existing click handler on btn_execute.
         btn_exec = getattr(self._move_planner, "btn_execute", None)
         if btn_exec is not None:
             try:
@@ -476,20 +491,52 @@ class RecordSetupScreen(QWidget):
                 pass
             btn_exec.clicked.connect(self._on_run_recipe_clicked)
 
+    def _get_spiral_scan_settings(self) -> dict:
+        """Read scan settings from the shared stepper widget's UI. Returns
+        {interval_min, center_col, center_row}. Falls back to defaults if
+        the widget isn't available."""
+        sw = self.shared_stepper_widget
+        try:
+            interval_min = int(sw.scan_interval_combo.currentText())
+            center_col = int(sw.scan_center_col_spin.value())
+            center_row = int(sw.scan_center_row_spin.value())
+        except Exception:
+            interval_min, center_col, center_row = 5, 13, 13
+        return {
+            "interval_min": interval_min,
+            "center_col": center_col,
+            "center_row": center_row,
+        }
+
     def _on_run_recipe_clicked(self):
-        """Wrapper around MovePlannerWidget._on_execute that enforces the
-        live-preview-on rule when the recipe needs calibration."""
+        """Wrapper around MovePlannerWidget._on_execute that enforces:
+          - live preview must be on if the recipe needs calibration during a
+            dwell or contains spiral_scan steps,
+          - calibration must be valid if the recipe contains spiral_scan steps."""
         try:
             needs_cal = self._move_planner.recipe_needs_calibration()
         except Exception:
             needs_cal = False
+        try:
+            needs_scan = self._move_planner.recipe_needs_spiral_scan()
+        except Exception:
+            needs_scan = False
 
-        if needs_cal and not self._live_running:
+        if (needs_cal or needs_scan) and not self._live_running:
             QMessageBox.warning(
                 self, "Live Preview Required",
-                "This recipe runs orientation calibration during one of its "
-                "dwells.\n\nStart the live camera preview first "
-                "(Show Live), then press Run Recipe again."
+                "This recipe needs the live camera preview "
+                "(calibration-during-dwell and/or spiral scan).\n\n"
+                "Start the live camera preview first (Show Live), "
+                "then press Run Recipe again."
+            )
+            return
+
+        if needs_scan and not self._orient_cal.get_result().valid:
+            QMessageBox.warning(
+                self, "Not Calibrated",
+                "This recipe contains a Spiral Scan step but the stage "
+                "isn't calibrated yet. Run 'Calibrate Stage' first."
             )
             return
 

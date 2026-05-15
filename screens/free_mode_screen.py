@@ -180,6 +180,7 @@ class FreeModeScreen(QWidget):
             camera_preview=self.camera_preview,
             mc=self.mc,
             motors_config=sw.MOTORS,
+            config=self.config,
             parent=self
         )
         self._af_controller.progress.connect(self._on_af_progress)

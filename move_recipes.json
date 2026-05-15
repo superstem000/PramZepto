@@ -10,6 +10,7 @@
         "speed": 0.01,
         "dwell_ms": 0,
         "override_z_limit": false,
+        "run_calibration_during_dwell": false,
         "note": ""
       },
       {
@@ -20,6 +21,7 @@
         "speed": 0.01,
         "dwell_ms": 0,
         "override_z_limit": false,
+        "run_calibration_during_dwell": false,
         "note": ""
       }
     ]
@@ -35,7 +37,24 @@
         "speed": 1.0,
         "dwell_ms": 0,
         "override_z_limit": false,
+        "run_calibration_during_dwell": false,
         "note": "Microfluidics routine"
+      }
+    ]
+  },
+  "spiralscan test": {
+    "name": "spiralscan test",
+    "steps": [
+      {
+        "step_type": "spiral_scan",
+        "x_us": 0,
+        "y_us": 0,
+        "z_us": 0,
+        "speed": 1.0,
+        "dwell_ms": 0,
+        "override_z_limit": false,
+        "run_calibration_during_dwell": false,
+        "note": "Spiral scan (one cycle, settings from stepper widget)"
       }
     ]
   }

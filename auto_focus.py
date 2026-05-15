@@ -12,8 +12,16 @@ position until arrival.  This avoids the 3D direction-vector issues
 that cause XY shaking on sub-full-step Z moves.
 
 All internal calculations use full-steps.
+
+Persistence:
+  The "known good" Z from the last successful calibration AF is saved
+  to calibration.json (alongside the stage calibration), under the key
+  'known_focus_fs'. On module import the value is read back and used as
+  the default center for regular full-AF runs (start()).
 """
 
+import json
+import os
 import numpy as np
 import scipy
 from scipy.ndimage import uniform_filter
@@ -21,7 +29,36 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 
 # ── Known Focus Reference ──────────────────────────────────────────
-KNOWN_FOCUS_FULLSTEP = 167.0
+# Updated at runtime when calibration-AF finishes. Persisted in
+# calibration.json under 'known_focus_fs'.
+KNOWN_FOCUS_FULLSTEP = 170.0
+
+
+def _try_load_known_focus_from_disk():
+    """On import, try the most likely calibration.json locations and
+    seed KNOWN_FOCUS_FULLSTEP. Silent if anything fails — we just keep
+    the hard-coded default."""
+    global KNOWN_FOCUS_FULLSTEP
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'calibration.json'),
+        os.path.join(os.getcwd(), 'calibration.json'),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                with open(p) as f:
+                    data = json.load(f)
+                v = data.get('known_focus_fs')
+                if v is not None:
+                    KNOWN_FOCUS_FULLSTEP = float(v)
+                    print(f"[AutoFocus] Loaded known_focus_fs={KNOWN_FOCUS_FULLSTEP:.2f} from {p}")
+                    return
+            except Exception as e:
+                print(f"[AutoFocus] Could not read known_focus from {p}: {e}")
+
+
+_try_load_known_focus_from_disk()
+
 
 # ── Search Profiles (all distances in full-steps) ─────────────────
 SEARCH_PROFILES = {
@@ -70,6 +107,13 @@ SEARCH_PROFILES = {
         ],
     },
 }
+
+# Calibration full AF: replaces stage 1 with a wide sweep from Z=100 to Z=200
+# (center=150, range=±50, step=1.5), then runs the same finer stages as
+# the regular SEARCH_PROFILES for mres=32.
+CALIBRATION_AF_STAGE1_CENTER_FS = 150.0
+CALIBRATION_AF_STAGE1_RANGE_FS  = 50.0    # ± from center -> 100..200
+CALIBRATION_AF_STAGE1_STEP_FS   = 1.5
 
 # Quick focus profiles
 QUICK_PROFILES = {
@@ -148,12 +192,14 @@ class AutoFocusController(QObject):
     Z_MIN_SPEED = 5.0     # minimum Z speed when close to target
     POLL_MS = 5            # how often to check Z position
 
-    def __init__(self, move_to_ctrl, camera_preview, mc, motors_config, parent=None):
+    def __init__(self, move_to_ctrl, camera_preview, mc, motors_config,
+                 config=None, parent=None):
         super().__init__(parent)
         self.move_to_ctrl   = move_to_ctrl  # kept for API compat, not used for Z
         self.camera_preview = camera_preview
         self.mc             = mc
         self.MOTORS         = motors_config
+        self.config         = config  # used to resolve calibration.json path
 
         self._active         = False
         self._stop_requested = False
@@ -172,6 +218,10 @@ class AutoFocusController(QObject):
         self._saved_speed_mult    = 1.0
         self._stages              = []
         self._stage_idx           = 0
+
+        # True only when start_calibration_af() was used — controls
+        # whether we persist the result as the new known_focus_fs.
+        self._is_calibration_af   = False
 
         self._z_target        = 0.0
         self._z_min_fs        = 0.0
@@ -257,7 +307,7 @@ class AutoFocusController(QObject):
         return self._active
 
     def start(self, camera_settings: dict):
-        """Start full autofocus."""
+        """Start full autofocus centered on KNOWN_FOCUS_FULLSTEP."""
         if self._active:
             return
         if not self.camera_preview.is_running():
@@ -268,6 +318,7 @@ class AutoFocusController(QObject):
         self._stop_requested = False
         self._camera_settings = camera_settings
         self._mres = self._get_z_mres()
+        self._is_calibration_af = False
 
         try:
             self._saved_speed_mult = self.mc.get_speed_multiplier()
@@ -288,13 +339,73 @@ class AutoFocusController(QObject):
             for s in self._stages
         )
         print(f"[AutoFocus] mres={self._mres}, {len(self._stages)} stages, "
-              f"~{total_positions} total positions")
+              f"~{total_positions} total positions, center={self._best_z_fs:.2f}fs")
+
+        self._begin_stage()
+
+    def start_calibration_af(self, camera_settings: dict):
+        """Start a calibration-style full AF.
+
+        Phase 1 is replaced with a wide sweep from Z=100 to Z=200 (center 150,
+        range ±50, step 1.5fs). Subsequent stages are the same finer sweeps
+        used by the regular full AF for mres=32. On success the resulting
+        best Z is persisted to calibration.json under 'known_focus_fs' and
+        the module-level KNOWN_FOCUS_FULLSTEP is updated so subsequent
+        regular AF runs use it as their center.
+        """
+        print(f"[AF] start_calibration_af called")
+        if self._active:
+            return
+        if not self.camera_preview.is_running():
+            self.finished.emit(False, "Start live preview before autofocusing.")
+            return
+
+        self._active         = True
+        self._stop_requested = False
+        self._camera_settings = camera_settings
+        self._mres = self._get_z_mres()
+        self._is_calibration_af = True
+
+        try:
+            self._saved_speed_mult = self.mc.get_speed_multiplier()
+        except Exception:
+            pass
+
+        # Phase 1: wide 100..200 sweep at 1.5fs steps.
+        # Phases 2/3: keep the finer stages from the mres=32 profile so we
+        # end up at sub-full-step accuracy.
+        finer_stages = SEARCH_PROFILES.get(self._mres, SEARCH_PROFILES[32])["stages"][1:]
+        if not finer_stages:
+            finer_stages = SEARCH_PROFILES[32]["stages"][1:]
+
+        self._stages = [
+            {"range": CALIBRATION_AF_STAGE1_RANGE_FS,
+             "step":  CALIBRATION_AF_STAGE1_STEP_FS},
+        ] + list(finer_stages)
+        self._stage_idx = 0
+
+        self._z_min_fs = float(getattr(self.MOTORS, "z_full_step_min", 0.0))
+        self._z_max_fs = float(getattr(self.MOTORS, "z_full_step_max", 1200.0))
+
+        # Start centered on 150 so stage 1 sweeps 100..200 regardless of
+        # current Z. Finer stages re-center on best Z found so far.
+        self._best_z_fs = CALIBRATION_AF_STAGE1_CENTER_FS
+
+        total_positions = sum(
+            max(3, int(2 * s["range"] / s["step"]) + 1)
+            for s in self._stages
+        )
+        print(f"[AutoFocus] CALIBRATION AF: mres={self._mres}, "
+              f"{len(self._stages)} stages, ~{total_positions} positions, "
+              f"stage1 sweeps Z={CALIBRATION_AF_STAGE1_CENTER_FS - CALIBRATION_AF_STAGE1_RANGE_FS:.0f}"
+              f"..{CALIBRATION_AF_STAGE1_CENTER_FS + CALIBRATION_AF_STAGE1_RANGE_FS:.0f}fs "
+              f"step={CALIBRATION_AF_STAGE1_STEP_FS}fs")
 
         self._begin_stage()
 
     def start_quick(self, camera_settings: dict, mode='normal', custom_range=None, center_z=None):
         """Quick refocus around current Z position.
-        
+
         If custom_range is provided, uses a single stage with that range
         and 0.2fs step size, ignoring the mode parameter.
         If center_z is provided, centers the search on that Z instead of current.
@@ -309,6 +420,7 @@ class AutoFocusController(QObject):
         self._stop_requested = False
         self._camera_settings = camera_settings
         self._mres = self._get_z_mres()
+        self._is_calibration_af = False
 
         try:
             self._saved_speed_mult = self.mc.get_speed_multiplier()
@@ -408,12 +520,54 @@ class AutoFocusController(QObject):
         self._active = False
         self._phase  = 'idle'
         self._restore_speed()
+
+        # If this was a calibration-AF run, persist the result.
+        if self._is_calibration_af:
+            self._is_calibration_af = False
+            self._persist_known_focus(self._best_z_fs)
+
         best_micro = self._fs_to_micro(self._best_z_fs)
         best_score = max(self._scores) if self._scores else 0.0
         msg = (f"Focus at Z = {best_micro} µsteps "
                f"({self._best_z_fs:.2f} fs, score {best_score:.0f})")
         print(f"[AutoFocus] Done — {msg}")
         self.finished.emit(True, msg)
+
+    def _persist_known_focus(self, z_fs: float):
+        """Update the in-memory KNOWN_FOCUS_FULLSTEP and write to
+        calibration.json so future AF runs default to this Z."""
+        global KNOWN_FOCUS_FULLSTEP
+        KNOWN_FOCUS_FULLSTEP = float(z_fs)
+        path = self._resolve_calibration_path()
+        if not path:
+            print(f"[AutoFocus] No calibration.json path resolvable; "
+                  f"known_focus_fs={z_fs:.2f} kept in memory only.")
+            return
+        # Merge with existing JSON
+        data = {}
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    data = json.load(f) or {}
+            except Exception as e:
+                print(f"[AutoFocus] Could not read existing {path}: {e}")
+                data = {}
+        data['known_focus_fs'] = float(z_fs)
+        try:
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2)
+            print(f"[AutoFocus] Persisted known_focus_fs={z_fs:.2f} to {path}")
+        except Exception as e:
+            print(f"[AutoFocus] Failed to write {path}: {e}")
+
+    def _resolve_calibration_path(self) -> str:
+        """Mirror stage_calibration._cal_path: calibration.json sits next
+        to the config.json. Falls back to module dir."""
+        cfg_path = getattr(self.config, 'cfg_path', '') if self.config else ''
+        if cfg_path:
+            return os.path.join(os.path.dirname(cfg_path), 'calibration.json')
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'calibration.json')
 
     def _on_move_finished(self, success: bool, message: str):
         """Legacy handler — kept for API compat, not used during AF sweeps."""

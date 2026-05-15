@@ -16,6 +16,12 @@ Calibration from scan data:
 
 After calibration: refinement moves + Z-tilt survey.
 All moves use slow speed, AF at every stop.
+
+NOTE: The initial AF (after move-to-center) now uses
+auto_focus.AutoFocusController.start_calibration_af(), which sweeps Z=100..200
+at 1.5fs as its stage 1, then refines. The best Z is persisted to
+calibration.json as 'known_focus_fs' so regular AF runs use it as their
+center on subsequent autofocus calls.
 """
 
 import json
@@ -168,29 +174,29 @@ def analyze_orientation(row_scan_data: List[Dict], col_scan_data: List[Dict]) ->
 
 def _compute_grid_pitch(scan_frames: List[Dict], direction: str) -> Optional[np.ndarray]:
     """Compute grid pitch in pixels from tile boundary crossings.
-    
+
     When the corrected marker ID changes between consecutive frames,
     we've crossed a tile boundary. The pixel position difference of
     markers at the new tile position gives grid_pitch_px directly.
-    
+
     direction: 'row' or 'col' — which pitch to compute.
     """
     pitch_samples = []
-    
+
     for i in range(len(scan_frames) - 1):
         markers_a = scan_frames[i]['markers']
         markers_b = scan_frames[i + 1]['markers']
-        
+
         if not markers_a or not markers_b:
             continue
-        
+
         # Get best marker from each frame
         best_a = markers_a[0]  # already sorted by centrality
         best_b = markers_b[0]
-        
+
         dcol = best_b['col_id'] - best_a['col_id']
         drow = best_b['row_id'] - best_a['row_id']
-        
+
         if direction == 'col' and dcol != 0 and drow == 0:
             # Pure col boundary crossing
             dpx = np.array([best_b['center'][0] - best_a['center'][0],
@@ -201,10 +207,10 @@ def _compute_grid_pitch(scan_frames: List[Dict], direction: str) -> Optional[np.
             dpx = np.array([best_b['center'][0] - best_a['center'][0],
                             best_b['center'][1] - best_a['center'][1]])
             pitch_samples.append(dpx / drow)
-    
+
     if not pitch_samples:
         return None
-    
+
     return np.mean(pitch_samples, axis=0)
 
 
@@ -224,12 +230,16 @@ CAL_SPEED_MULTIPLIER = 0.5
 class OrientCalibrationController(QObject):
     """
     Combined orientation detection + stage calibration.
-    
+
     All tile moves use slow speed, AF at every stop.
     Calibration is computed from scan data:
       - motor_to_px from matched markers across consecutive frames
       - grid_pitch from tile boundary crossings
     No requirement for 2+ markers in any single frame.
+
+    The initial AF after move-to-center uses the calibration-AF entry point
+    on AutoFocusController, which sweeps Z=100..200 at 1.5fs and persists
+    the result as the new known_focus_fs in calibration.json.
     """
 
     progress = pyqtSignal(str, str)
@@ -445,9 +455,13 @@ class OrientCalibrationController(QObject):
         if self._stop_requested:
             return
         self._phase = 'initial_af'
-        self.progress.emit('af', 'Autofocusing at safe center...')
+        self.progress.emit('af', 'Calibration AF (Z=100..200)...')
         if self.af_controller:
-            self.af_controller.start(self._camera_settings)
+            # Wide-sweep calibration AF: stage 1 sweeps Z=100..200 at 1.5fs,
+            # subsequent stages refine, and the final best Z is persisted to
+            # calibration.json under 'known_focus_fs' for future regular AF
+            # runs.
+            self.af_controller.start_calibration_af(self._camera_settings)
         else:
             QTimer.singleShot(SETTLE_MS, self._capture_reference)
 
@@ -597,7 +611,7 @@ class OrientCalibrationController(QObject):
 
     def _compute_calibration_from_scans(self):
         """Use scan data to compute motor_to_px and grid pitch.
-        
+
         1. Reset calibration (no stale fallbacks)
         2. Correct all stored marker IDs for orientation
         3. Match same markers across consecutive frames → motor_to_px
@@ -1322,6 +1336,7 @@ class OrientCalibrationController(QObject):
     # ═══════════════════════════════════════════════════════════════
 
     def _on_move_finished(self, success, message):
+        print(f"[OrientCal] _on_move_finished success={success}")
         if not self._active or self._phase == 'idle':
             return
         if self._phase in ('z_spiral_scan', 'refine_spiral_scan'):

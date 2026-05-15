@@ -27,12 +27,17 @@ class RecipeStep:
     Types:
         'move'          — move to absolute XYZ (microsteps) at given speed
         'microfluidics' — run the hardcoded microfluidics sub-sequence
-        'spiral_scan'   — move to scan position, then run spiral scan
+        'spiral_scan'   — run a spiral scan (one cycle), then advance
 
     Fields used per type:
         move:           x_us, y_us, z_us, speed, dwell_ms, override_z_limit
         microfluidics:  dwell_ms (wait after completion)
-        spiral_scan:    dwell_ms (wait after completion)
+        spiral_scan:    dwell_ms (wait after one cycle completes). The
+                        scan controller picks up its settings from the
+                        provider registered with the planner — typically
+                        the stepper widget's scan settings UI (interval,
+                        center_col, center_row), matching what the
+                        stepper-widget Spiral Scan button does.
     """
     step_type: str = "move"       # "move", "microfluidics", "spiral_scan"
     x_us: int = 0                 # X in microsteps (mres=32)
@@ -58,41 +63,41 @@ class MoveRecipe:
 
 MICROFLUIDICS_SEQUENCE = [
     # Move to push position 1
-    RecipeStep(step_type="move", x_us=35867, y_us=17100, z_us=21689,#z was 24224 y was 20498
+    RecipeStep(step_type="move", x_us=35867, y_us=17100, z_us=22589,
                speed=2.67, override_z_limit=True),
     # Fast approach
-    RecipeStep(step_type="move", x_us=21000, y_us=17100, z_us=21689,
+    RecipeStep(step_type="move", x_us=21000, y_us=17100, z_us=22589,
                speed=2.67, override_z_limit=True),
     # Slow push
-    RecipeStep(step_type="move", x_us=10677, y_us=17100, z_us=21689,
+    RecipeStep(step_type="move", x_us=10677, y_us=17100, z_us=22589,
                speed=0.02, override_z_limit=True),
     # Fast retract
-    RecipeStep(step_type="move", x_us=35867, y_us=17100, z_us=21689,
+    RecipeStep(step_type="move", x_us=35867, y_us=17100, z_us=22589,
                speed=2.67, override_z_limit=True),
     # 1-hour wait between pushes — orient calibration runs in parallel during
     # the dwell. If cal takes longer than 1 hour, planner waits for it to
     # finish before advancing to push 2.
-    #RecipeStep(step_type="move", x_us=35867, y_us=17100, z_us=21689,
-    #           speed=2.67, override_z_limit=True,
-    #           dwell_ms=60 * 60 * 1000,
-    #           run_calibration_during_dwell=True,
-    #           note="1 hour wait between pushes (calibration runs in parallel)"),
+    RecipeStep(step_type="move", x_us=35867, y_us=17100, z_us=22589,
+               speed=2.67, override_z_limit=True,
+               dwell_ms=60 * 60 * 1000,
+               run_calibration_during_dwell=True,
+               note="1 hour wait between pushes (calibration runs in parallel)"),
     # Move to push position 2
-    RecipeStep(step_type="move", x_us=35867, y_us=35483, z_us=21689, #y was 38881
+    RecipeStep(step_type="move", x_us=35867, y_us=36986, z_us=22589,
                speed=2.67, override_z_limit=True),
     # Fast approach
-    RecipeStep(step_type="move", x_us=21000, y_us=35483, z_us=21689,
+    RecipeStep(step_type="move", x_us=21000, y_us=36986, z_us=22589,
                speed=2.67, override_z_limit=True),
     # Slow push
-    RecipeStep(step_type="move", x_us=10677, y_us=35483, z_us=21689,
+    RecipeStep(step_type="move", x_us=10677, y_us=36986, z_us=22589,
                speed=0.02, override_z_limit=True),
     # Fast retract — then 20-minute settle wait before final Z retract
-    RecipeStep(step_type="move", x_us=35867, y_us=35483, z_us=21689,
+    RecipeStep(step_type="move", x_us=35867, y_us=36986, z_us=22589,
                speed=2.67, override_z_limit=True,
                #dwell_ms=20 * 60 * 1000,
                note="Settle 20 min before final Z retract"),
     # Final Z retract
-    RecipeStep(step_type="move", x_us=35867, y_us=35483, z_us=0,
+    RecipeStep(step_type="move", x_us=35867, y_us=36986, z_us=0,
                speed=2.67, override_z_limit=True),
 ]
 
@@ -110,7 +115,7 @@ class MovePlannerWidget(QWidget):
     Supports three step types:
       - Move: go to absolute XYZ (microsteps) at a given speed
       - Microfluidics: hardcoded sub-sequence of fine movements
-      - Spiral Scan: placeholder for spiral scan integration
+      - Spiral Scan: runs one full spiral-scan cycle, then advances
     """
 
     def __init__(
@@ -166,6 +171,13 @@ class MovePlannerWidget(QWidget):
         self._cal_running_for_step = False  # we kicked off cal for this dwell
         self._waiting_for_cal = False       # dwell expired, holding for cal
 
+        # Spiral-scan-step hooks. The host screen calls
+        # set_spiral_scan_controller() and set_spiral_scan_settings_provider()
+        # to wire these up. When unset, spiral_scan steps are skipped.
+        self._spiral_scan = None
+        self._spiral_scan_settings_provider = None
+        self._spiral_scan_running_for_step = False  # we kicked off scan for this step
+
         self._build_move_planner_ui()
 
         if self.mode == 'full':
@@ -190,8 +202,22 @@ class MovePlannerWidget(QWidget):
 
     def set_camera_settings_provider(self, provider):
         """Set a no-arg callable returning the current camera settings dict.
-        Required for run_calibration_during_dwell to actually start cal."""
+        Required for run_calibration_during_dwell to actually start cal AND
+        for spiral_scan steps."""
         self._camera_settings_provider = provider
+
+    def set_spiral_scan_controller(self, spiral_scan):
+        """Wire the spiral-scan controller. When a recipe step has
+        step_type=='spiral_scan', the planner calls spiral_scan.configure(...)
+        and spiral_scan.start(settings), then advances when one cycle
+        completes (detected by progress emitting phase='waiting')."""
+        self._spiral_scan = spiral_scan
+
+    def set_spiral_scan_settings_provider(self, provider):
+        """Set a no-arg callable returning (interval_min, center_col, center_row)
+        for the spiral scan. Typically reads the stepper widget's scan
+        settings UI so the planner mirrors the Spiral Scan button."""
+        self._spiral_scan_settings_provider = provider
 
     def recipe_needs_calibration(self) -> bool:
         """True if the currently-loaded recipe contains any step that requests
@@ -210,6 +236,16 @@ class MovePlannerWidget(QWidget):
                     if getattr(sub, "run_calibration_during_dwell", False):
                         return True
         return False
+
+    def recipe_needs_spiral_scan(self) -> bool:
+        """True if the recipe contains any spiral_scan step. Host screen
+        uses this to gate Run Recipe behind 'live preview must be on' and
+        'calibration must exist'."""
+        try:
+            steps = self._read_table_steps()
+        except Exception:
+            return False
+        return any(s.step_type == "spiral_scan" for s in steps)
 
     # =========================
     # UI
@@ -481,7 +517,7 @@ class MovePlannerWidget(QWidget):
         step = RecipeStep(
             step_type="spiral_scan",
             dwell_ms=self.dwell_ms.value(),
-            note="Spiral scan",
+            note="Spiral scan (one cycle, settings from stepper widget)",
         )
         self._add_step_to_table(step)
         self._set_status("Added spiral scan step.")
@@ -824,6 +860,8 @@ class MovePlannerWidget(QWidget):
         self._micro_seq_index = -1
         # Stop any running cal we kicked off during a dwell
         self._cleanup_cal_during_dwell(stop_cal=True)
+        # Stop any running spiral scan we kicked off
+        self._cleanup_spiral_scan(stop_scan=True)
         self._restore_z_limit()
         # Restore speed
         try:
@@ -870,12 +908,7 @@ class MovePlannerWidget(QWidget):
         elif step.step_type == "spiral_scan":
             self._pending_dwell_ms = step.dwell_ms
             self._pending_cal_during_dwell = False
-            self._set_status(f"Step {self._exec_index + 1}: Spiral Scan...")
-            # TODO: integrate with SpiralScanController
-            # For now, skip with a warning
-            print("[Planner] Spiral scan step — not yet integrated")
-            self._set_status("Spiral scan: not yet integrated, skipping...")
-            self._handle_dwell_or_advance()
+            self._execute_spiral_scan_step(step)
 
     def _execute_move_step(self, step: RecipeStep):
         """Execute a single move step."""
@@ -939,6 +972,160 @@ class MovePlannerWidget(QWidget):
         self._execute_move_step(sub_step)
 
     # =========================
+    # Spiral scan step
+    # =========================
+
+    def _execute_spiral_scan_step(self, step: RecipeStep):
+        """Kick off the spiral scan controller. Advance once one full cycle
+        completes (detected via progress signal phase='waiting'). The post-step
+        dwell, if any, runs after the cycle completes the same way it would
+        for any other step."""
+        if not self._exec_active:
+            return
+
+        if self._spiral_scan is None:
+            print("[Planner] spiral_scan step requested but no spiral_scan "
+                  "controller wired up — skipping.")
+            self._set_status(f"Step {self._exec_index + 1}: Spiral Scan: no controller, skipping.")
+            self._handle_dwell_or_advance()
+            return
+
+        if self._spiral_scan.is_active():
+            print("[Planner] spiral_scan step requested but a scan is already "
+                  "active — skipping.")
+            self._set_status(f"Step {self._exec_index + 1}: Spiral Scan: already active, skipping.")
+            self._handle_dwell_or_advance()
+            return
+
+        # Resolve camera settings
+        camera_settings = {}
+        try:
+            if callable(self._camera_settings_provider):
+                camera_settings = self._camera_settings_provider() or {}
+        except Exception as e:
+            print(f"[Planner] Camera settings provider failed: {e}")
+            camera_settings = {}
+
+        # Resolve scan settings (interval, center_col, center_row)
+        interval_min = 5
+        center_col = 13
+        center_row = 13
+        try:
+            if callable(self._spiral_scan_settings_provider):
+                vals = self._spiral_scan_settings_provider() or {}
+                # Provider may return a dict or a 3-tuple
+                if isinstance(vals, dict):
+                    interval_min = int(vals.get('interval_min', interval_min))
+                    center_col = int(vals.get('center_col', center_col))
+                    center_row = int(vals.get('center_row', center_row))
+                else:
+                    interval_min = int(vals[0])
+                    center_col = int(vals[1])
+                    center_row = int(vals[2])
+        except Exception as e:
+            print(f"[Planner] Spiral scan settings provider failed: {e}, "
+                  f"using defaults ({interval_min}min, {center_col},{center_row})")
+
+        # Configure the scan
+        try:
+            self._spiral_scan.configure(
+                interval_min=interval_min,
+                center_col=center_col,
+                center_row=center_row,
+            )
+        except Exception as e:
+            print(f"[Planner] spiral_scan.configure failed: {e}")
+            self._finish_execution(f"Spiral scan configure failed: {e}")
+            return
+
+        # Connect to progress so we know when one cycle completes.
+        # Spiral scan's normal mode loops forever waiting on the interval
+        # timer; we stop it as soon as it enters the 'waiting' phase
+        # (which means one full cycle has finished, including the return
+        # to center and post-cycle fine correction).
+        try:
+            self._spiral_scan.progress.connect(self._on_spiral_scan_progress)
+        except Exception:
+            pass
+        # Also connect to finished so we react to errors / external stops.
+        try:
+            self._spiral_scan.finished.connect(self._on_spiral_scan_finished)
+        except Exception:
+            pass
+
+        self._spiral_scan_running_for_step = True
+
+        self._set_status(
+            f"Step {self._exec_index + 1}: Spiral Scan "
+            f"(center=({center_col},{center_row}), interval={interval_min}min)..."
+        )
+
+        try:
+            self._spiral_scan.start(camera_settings)
+            print(f"[Planner] Spiral scan started for recipe step.")
+        except Exception as e:
+            print(f"[Planner] spiral_scan.start failed: {e}")
+            self._cleanup_spiral_scan(stop_scan=False)
+            self._finish_execution(f"Spiral scan start failed: {e}")
+
+    def _on_spiral_scan_progress(self, phase, message):
+        """Detect cycle completion by watching for phase=='waiting'. The scan
+        controller enters that phase after finishing one full cycle (including
+        return to center and final fine-correct), right before the inter-cycle
+        timer would normally fire."""
+        if not self._spiral_scan_running_for_step:
+            return
+        if not self._exec_active:
+            return
+        if phase == 'waiting':
+            print(f"[Planner] Spiral scan cycle complete, stopping scan and "
+                  f"advancing recipe.")
+            # Stop the scan so it doesn't wait for the inter-cycle timer
+            try:
+                if self._spiral_scan is not None and self._spiral_scan.is_active():
+                    self._spiral_scan.stop("Recipe step complete (one cycle)")
+            except Exception as e:
+                print(f"[Planner] Error stopping spiral scan after cycle: {e}")
+            # stop() will fire `finished` synchronously which lands in
+            # _on_spiral_scan_finished — that handles the advance.
+
+    def _on_spiral_scan_finished(self, success, message):
+        """Handle the scan's finished signal. Fires when:
+          - we asked it to stop after one cycle (success=False, but expected),
+          - the scan errored,
+          - the user pressed stop elsewhere.
+        Either way: clean up signal connections and advance the recipe."""
+        if not self._spiral_scan_running_for_step:
+            return
+        if not self._exec_active:
+            self._cleanup_spiral_scan(stop_scan=False)
+            return
+
+        print(f"[Planner] Spiral scan finished: ok={success} msg={message}")
+        self._cleanup_spiral_scan(stop_scan=False)
+        # Advance through normal dwell-or-advance path.
+        self._handle_dwell_or_advance()
+
+    def _cleanup_spiral_scan(self, stop_scan: bool):
+        """Disconnect our slots and optionally stop the running scan."""
+        if self._spiral_scan is not None:
+            try:
+                self._spiral_scan.progress.disconnect(self._on_spiral_scan_progress)
+            except Exception:
+                pass
+            try:
+                self._spiral_scan.finished.disconnect(self._on_spiral_scan_finished)
+            except Exception:
+                pass
+            if stop_scan:
+                try:
+                    if self._spiral_scan.is_active():
+                        self._spiral_scan.stop("Recipe stopped")
+                except Exception:
+                    pass
+        self._spiral_scan_running_for_step = False
+
+    # =========================
     # Move completion handler
     # =========================
 
@@ -952,6 +1139,10 @@ class MovePlannerWidget(QWidget):
         # signal is in charge of advancing — not move_to_ctrl.
         if self._dwell_timer.isActive() or self._waiting_for_cal \
                 or self._cal_running_for_step:
+            return
+
+        # Same idea for an active spiral scan: it issues its own moves.
+        if self._spiral_scan_running_for_step:
             return
 
         if not success:
@@ -1138,6 +1329,7 @@ class MovePlannerWidget(QWidget):
         # Disconnect our cal slot but don't stop a running cal — if it's still
         # going when the recipe ends naturally, let it finish.
         self._cleanup_cal_during_dwell(stop_cal=False)
+        self._cleanup_spiral_scan(stop_scan=False)
         self._restore_z_limit()
         # Restore speed
         try:

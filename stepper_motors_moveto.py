@@ -148,6 +148,7 @@ class StepperMotorsMoveto(QObject):
                 self._timer.start()
         else:
             # Already at target
+            print(f"[MoveTo] emit finished (already-at-target)")
             self.finished.emit(True, "")
             return
 
@@ -244,6 +245,7 @@ class StepperMotorsMoveto(QObject):
         self.motion.stop_immediate()
         self._restore_profile()
         self.statusChanged.emit("Idle", "gray")
+        print(f"[MoveTo] emit finished (real)")
         self.finished.emit(True, "")
 
     def _advance_phase(self):
