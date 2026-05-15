@@ -53,9 +53,9 @@
     "y_full_step_max": 5200,
     "z_full_step_min": 0,
     "z_full_step_max": 1200,
-    "x_current_position_full_step": 1348.375,
-    "y_current_position_full_step": 517.375,
-    "z_current_position_full_step": 104.46875
+    "x_current_position_full_step": 4272.5625,
+    "y_current_position_full_step": 436.5,
+    "z_current_position_full_step": 176.5
   },
   "endstops": {
     "chip": 0,

@@ -226,8 +226,8 @@ class SpiralScanController(QObject):
         row_fs = cal.grid_pitch_row_fs
         max_x_per_tile = max(abs(col_fs[0]), abs(row_fs[0]))
         max_y_per_tile = max(abs(col_fs[1]), abs(row_fs[1]))
-        limit_x = max_x_per_tile * 3.0
-        limit_y = max_y_per_tile * 3.0
+        limit_x = max_x_per_tile * 4.0
+        limit_y = max_y_per_tile * 4.0
         if abs(dx_fs) > limit_x or abs(dy_fs) > limit_y:
             print(f"[DemoScan] MOVE CAP: blocked ({dx_fs:.1f},{dy_fs:.1f})fs, "
                   f"limit ({limit_x:.1f},{limit_y:.1f})fs")
