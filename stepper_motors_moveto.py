@@ -80,6 +80,7 @@ class StepperMotorsMoveto(QObject):
         Pure Z to ~0: home Z.
         Pure Z to other: move directly.
         """
+        print(f"[MoveTo id={id(self)}] start({tx_fs:.1f}, {ty_fs:.1f}, {tz_fs:.1f}) _active={self._active}")
         if self._active:
             self.finished.emit(False, "Busy: move-to already active.")
             return

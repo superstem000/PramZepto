@@ -313,6 +313,7 @@ class OrientCalibrationController(QObject):
         self.move_to_ctrl.finished.connect(self._on_move_finished)
         if self.af_controller:
             self.af_controller.finished.connect(self._on_af_finished)
+        print(f"[OrientCal id={id(self)}] __init__ done, connected to move_to_ctrl.finished (move_to_ctrl id={id(self.move_to_ctrl)})")
 
     # ── Public API ──
 
@@ -454,6 +455,7 @@ class OrientCalibrationController(QObject):
     def _start_autofocus(self):
         if self._stop_requested:
             return
+        print(f"[OrientCal id={id(self)}] _start_autofocus fired, phase was {self._phase}")
         self._phase = 'initial_af'
         self.progress.emit('af', 'Calibration AF (Z=100..200)...')
         if self.af_controller:
@@ -1336,7 +1338,7 @@ class OrientCalibrationController(QObject):
     # ═══════════════════════════════════════════════════════════════
 
     def _on_move_finished(self, success, message):
-        print(f"[OrientCal] _on_move_finished success={success}")
+        print(f"[OrientCal id={id(self)}] _on_move_finished success={success} active={self._active} phase={self._phase}")
         if not self._active or self._phase == 'idle':
             return
         if self._phase in ('z_spiral_scan', 'refine_spiral_scan'):

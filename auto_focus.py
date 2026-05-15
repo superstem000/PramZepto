@@ -354,6 +354,7 @@ class AutoFocusController(QObject):
         regular AF runs use it as their center.
         """
         print(f"[AF] start_calibration_af called")
+        print(f"[AF] start_calibration_af id={id(self)} active={self._active}")
         if self._active:
             return
         if not self.camera_preview.is_running():
