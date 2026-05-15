@@ -1,0 +1,1151 @@
+import json
+import os
+from dataclasses import dataclass, asdict, field
+from typing import Dict, List, Optional, Tuple
+
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import (
+    QWidget, QFrame, QLabel, QPushButton, QComboBox, QLineEdit,
+    QHBoxLayout, QVBoxLayout, QFormLayout, QGridLayout,
+    QSpinBox, QDoubleSpinBox,
+    QTableWidget, QTableWidgetItem, QHeaderView,
+    QAbstractItemView, QMessageBox, QInputDialog,
+    QSizePolicy
+)
+
+from widget_collapsible_box import CollapsibleBox
+
+
+# ═══════════════════════════════════════════════════════════════
+# Data model
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class RecipeStep:
+    """One step in a recipe. Type determines how it's executed.
+
+    Types:
+        'move'          — move to absolute XYZ (microsteps) at given speed
+        'microfluidics' — run the hardcoded microfluidics sub-sequence
+        'spiral_scan'   — move to scan position, then run spiral scan
+
+    Fields used per type:
+        move:           x_us, y_us, z_us, speed, dwell_ms, override_z_limit
+        microfluidics:  dwell_ms (wait after completion)
+        spiral_scan:    dwell_ms (wait after completion)
+    """
+    step_type: str = "move"       # "move", "microfluidics", "spiral_scan"
+    x_us: int = 0                 # X in microsteps (mres=32)
+    y_us: int = 0                 # Y in microsteps
+    z_us: int = 0                 # Z in microsteps
+    speed: float = 1.0            # speed multiplier (0.01 - 2.67)
+    dwell_ms: int = 0             # wait time after step completes
+    override_z_limit: bool = False  # bypass z_global_max safety bound
+    run_calibration_during_dwell: bool = False  # kick off orient_cal at dwell start;
+                                                # if cal still running when dwell ends, wait for it
+    note: str = ""
+
+
+@dataclass
+class MoveRecipe:
+    name: str
+    steps: List[RecipeStep] = field(default_factory=list)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Microfluidics hardcoded sequence (all positions in microsteps)
+# ═══════════════════════════════════════════════════════════════
+
+MICROFLUIDICS_SEQUENCE = [
+    # Move to push position 1
+    RecipeStep(step_type="move", x_us=35867, y_us=17100, z_us=21689,#z was 24224 y was 20498
+               speed=2.67, override_z_limit=True),
+    # Fast approach
+    RecipeStep(step_type="move", x_us=21000, y_us=17100, z_us=21689,
+               speed=2.67, override_z_limit=True),
+    # Slow push
+    RecipeStep(step_type="move", x_us=10677, y_us=17100, z_us=21689,
+               speed=0.02, override_z_limit=True),
+    # Fast retract
+    RecipeStep(step_type="move", x_us=35867, y_us=17100, z_us=21689,
+               speed=2.67, override_z_limit=True),
+    # 1-hour wait between pushes — orient calibration runs in parallel during
+    # the dwell. If cal takes longer than 1 hour, planner waits for it to
+    # finish before advancing to push 2.
+    #RecipeStep(step_type="move", x_us=35867, y_us=17100, z_us=21689,
+    #           speed=2.67, override_z_limit=True,
+    #           dwell_ms=60 * 60 * 1000,
+    #           run_calibration_during_dwell=True,
+    #           note="1 hour wait between pushes (calibration runs in parallel)"),
+    # Move to push position 2
+    RecipeStep(step_type="move", x_us=35867, y_us=35483, z_us=21689, #y was 38881
+               speed=2.67, override_z_limit=True),
+    # Fast approach
+    RecipeStep(step_type="move", x_us=21000, y_us=35483, z_us=21689,
+               speed=2.67, override_z_limit=True),
+    # Slow push
+    RecipeStep(step_type="move", x_us=10677, y_us=35483, z_us=21689,
+               speed=0.02, override_z_limit=True),
+    # Fast retract — then 20-minute settle wait before final Z retract
+    RecipeStep(step_type="move", x_us=35867, y_us=35483, z_us=21689,
+               speed=2.67, override_z_limit=True,
+               #dwell_ms=20 * 60 * 1000,
+               note="Settle 20 min before final Z retract"),
+    # Final Z retract
+    RecipeStep(step_type="move", x_us=35867, y_us=35483, z_us=0,
+               speed=2.67, override_z_limit=True),
+]
+
+
+# ═══════════════════════════════════════════════════════════════
+# Widget
+# ═══════════════════════════════════════════════════════════════
+
+MRES = 32  # locked microstepping resolution
+
+class MovePlannerWidget(QWidget):
+    """
+    Sequence builder for automated stage control.
+
+    Supports three step types:
+      - Move: go to absolute XYZ (microsteps) at a given speed
+      - Microfluidics: hardcoded sub-sequence of fine movements
+      - Spiral Scan: placeholder for spiral scan integration
+    """
+
+    def __init__(
+        self,
+        parent_layout,
+        config,
+        stepper_widget,
+        recipes_path: Optional[str] = None,
+        mode: str = 'full',
+        parent=None,
+    ):
+        super().__init__(parent)
+
+        self.parent_layout = parent_layout
+        self.config = config
+        self.stepper = stepper_widget
+        self.mode = mode
+
+        if recipes_path is None:
+            cfg_dir = os.path.dirname(getattr(self.config, "cfg_path", "") or "")
+            if cfg_dir and os.path.isdir(cfg_dir):
+                recipes_path = os.path.join(cfg_dir, "move_recipes.json")
+            else:
+                recipes_path = os.path.join(os.getcwd(), "move_recipes.json")
+        self.recipes_path = recipes_path
+
+        self._recipes: Dict[str, MoveRecipe] = {}
+        self._active_recipe_name: Optional[str] = None
+
+        # Execution state
+        self._exec_active = False
+        self._exec_index = -1
+        self._pending_dwell_ms = 0
+        self._pending_cal_during_dwell = False  # set per-step from RecipeStep
+        self._micro_seq_index = -1  # sub-index within microfluidics sequence
+        self._saved_speed_mult = 1.0
+        self._saved_z_limit = None  # saved z_global_max for restore
+
+        self._dwell_timer = QTimer(self)
+        self._dwell_timer.setSingleShot(True)
+        self._dwell_timer.timeout.connect(self._on_dwell_timeout)
+
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.setInterval(1000)
+        self._countdown_timer.timeout.connect(self._update_countdown)
+        self._dwell_remaining_ms = 0
+
+        # Calibration-during-dwell hooks. The host screen calls
+        # set_orient_cal_controller() and set_camera_settings_provider() to
+        # wire these up. When unset, run_calibration_during_dwell is a no-op.
+        self._orient_cal = None
+        self._camera_settings_provider = None
+        self._cal_running_for_step = False  # we kicked off cal for this dwell
+        self._waiting_for_cal = False       # dwell expired, holding for cal
+
+        self._build_move_planner_ui()
+
+        if self.mode == 'full':
+            try:
+                self.stepper.move_to_ctrl.finished.connect(self._on_move_to_finished)
+            except Exception:
+                pass
+
+        self._load_recipes_from_disk()
+        self._refresh_recipe_combo()
+
+    # =========================
+    # Public hooks (set by host screen)
+    # =========================
+
+    def set_orient_cal_controller(self, orient_cal):
+        """Wire the orientation calibration controller. When a recipe step
+        has run_calibration_during_dwell=True, the planner calls
+        orient_cal.start(settings) at the start of that dwell and waits for
+        it to finish (or for the dwell to expire, whichever is later)."""
+        self._orient_cal = orient_cal
+
+    def set_camera_settings_provider(self, provider):
+        """Set a no-arg callable returning the current camera settings dict.
+        Required for run_calibration_during_dwell to actually start cal."""
+        self._camera_settings_provider = provider
+
+    def recipe_needs_calibration(self) -> bool:
+        """True if the currently-loaded recipe contains any step that requests
+        calibration during its dwell. Used by the host screen to gate Run
+        Recipe behind 'live preview must be on'."""
+        try:
+            steps = self._read_table_steps()
+        except Exception:
+            return False
+        for s in steps:
+            if getattr(s, "run_calibration_during_dwell", False):
+                return True
+            # Microfluidics step expands into MICROFLUIDICS_SEQUENCE — check that too
+            if s.step_type == "microfluidics":
+                for sub in MICROFLUIDICS_SEQUENCE:
+                    if getattr(sub, "run_calibration_during_dwell", False):
+                        return True
+        return False
+
+    # =========================
+    # UI
+    # =========================
+
+    def _build_move_planner_ui(self):
+        box = CollapsibleBox("Sequence Planner")
+
+        panel = QFrame()
+        panel_layout = QHBoxLayout(panel)
+        panel_layout.setContentsMargins(25, 25, 25, 35)
+        panel_layout.setSpacing(35)
+
+        # ==========================
+        # LEFT COLUMN
+        # ==========================
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(15)
+
+        # 1. Recipe Selection
+        recipe_row = QHBoxLayout()
+        recipe_lbl = QLabel("Recipe:")
+        recipe_lbl.setStyleSheet("font-weight: bold;")
+        self.recipe_combo = QComboBox()
+        self.recipe_combo.setMinimumHeight(45)
+        self.recipe_combo.currentTextChanged.connect(self._on_recipe_selected)
+        recipe_row.addWidget(recipe_lbl)
+        recipe_row.addWidget(self.recipe_combo, 1)
+        left_layout.addLayout(recipe_row)
+
+        # 2. Recipe Name Edit
+        self.recipe_name_edit = QLineEdit()
+        self.recipe_name_edit.setPlaceholderText("New recipe name (optional)")
+        self.recipe_name_edit.setMinimumHeight(45)
+        left_layout.addWidget(self.recipe_name_edit)
+
+        # 3. Step type selector
+        type_layout = QVBoxLayout()
+        type_layout.setSpacing(8)
+
+        type_lbl = QLabel("Add:")
+        type_lbl.setStyleSheet("font-weight: bold;")
+        type_layout.addWidget(type_lbl)
+
+        self.btn_add_move = QPushButton("Move Step")
+        self.btn_add_move.setMinimumHeight(150)
+        self.btn_add_move.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        self.btn_add_move.clicked.connect(self._on_add_move_step)
+        type_layout.addWidget(self.btn_add_move)
+
+        self.btn_add_microfluidics = QPushButton("Microfluidics")
+        self.btn_add_microfluidics.setMinimumHeight(150)
+        self.btn_add_microfluidics.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+        self.btn_add_microfluidics.clicked.connect(self._on_add_microfluidics)
+        type_layout.addWidget(self.btn_add_microfluidics)
+
+        self.btn_add_spiral = QPushButton("Spiral Scan")
+        self.btn_add_spiral.setMinimumHeight(150)
+        self.btn_add_spiral.setStyleSheet("background-color: #1565C0; color: white; font-weight: bold;")
+        self.btn_add_spiral.clicked.connect(self._on_add_spiral_scan)
+        type_layout.addWidget(self.btn_add_spiral)
+
+        left_layout.addLayout(type_layout)
+
+        # 4. Move input fields
+        left_layout.addSpacing(10)
+
+        self.x_us = QSpinBox()
+        self.y_us = QSpinBox()
+        self.z_us = QSpinBox()
+        self.speed_spin = QDoubleSpinBox()
+        self.dwell_ms = QSpinBox()
+
+        for sb in (self.x_us, self.y_us, self.z_us):
+            sb.setRange(0, 200000)
+            sb.setSingleStep(32)
+            sb.setMinimumHeight(45)
+
+        self.speed_spin.setDecimals(2)
+        self.speed_spin.setRange(0.01, 2.67)
+        self.speed_spin.setValue(1.0)
+        self.speed_spin.setSingleStep(0.1)
+        self.speed_spin.setPrefix("x")
+        self.speed_spin.setMinimumHeight(45)
+
+        self.dwell_ms.setRange(0, 60_000_000)
+        self.dwell_ms.setSingleStep(100)
+        self.dwell_ms.setSuffix(" ms")
+        self.dwell_ms.setMinimumHeight(45)
+
+        try:
+            self.x_us.setRange(0, int(float(getattr(self.stepper.MOTORS, "x_full_step_max", 6000)) * MRES))
+            self.y_us.setRange(0, int(float(getattr(self.stepper.MOTORS, "y_full_step_max", 5200)) * MRES))
+            self.z_us.setRange(0, int(float(getattr(self.stepper.MOTORS, "z_full_step_max", 1200)) * MRES))
+        except Exception:
+            pass
+
+        try:
+            self.speed_spin.setRange(
+                self.stepper.mc.get_min_multiplier(),
+                self.stepper.mc.get_max_multiplier()
+            )
+        except Exception:
+            pass
+
+        for label_text, widget in [
+            ("X (µsteps):", self.x_us),
+            ("Y (µsteps):", self.y_us),
+            ("Z (µsteps):", self.z_us),
+            ("Speed:", self.speed_spin),
+            ("Dwell:", self.dwell_ms),
+        ]:
+            row = QHBoxLayout()
+            row.setSpacing(15)
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(120)
+            row.addWidget(lbl)
+            row.addWidget(widget, 1)
+            left_layout.addLayout(row)
+
+        self.btn_use_current = QPushButton("Use Current Position")
+        self.btn_use_current.setMinimumHeight(45)
+        self.btn_use_current.clicked.connect(self._on_use_current)
+        left_layout.addWidget(self.btn_use_current)
+
+        left_layout.addSpacing(10)
+
+        # 5. Table
+        # Columns: #, Type, X, Y, Z, Speed, Dwell
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["#", "Type", "X", "Y", "Z", "Speed", "Dwell"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setMinimumHeight(250)
+        self.table.verticalHeader().setDefaultSectionSize(40)
+
+        # Column widths
+        self.table.setColumnWidth(0, 35)   # #
+        self.table.setColumnWidth(1, 110)  # Type
+        self.table.setColumnWidth(2, 70)   # X
+        self.table.setColumnWidth(3, 70)   # Y
+        self.table.setColumnWidth(4, 70)   # Z
+        self.table.setColumnWidth(5, 60)   # Speed
+        self.table.setColumnWidth(6, 70)   # Dwell
+
+        left_layout.addWidget(self.table)
+
+        # Status
+        self.status_lbl = QLabel("Ready.")
+        self.status_lbl.setStyleSheet("color: gray; margin-top: 5px;")
+        left_layout.addWidget(self.status_lbl)
+
+        # ==========================
+        # RIGHT COLUMN
+        # ==========================
+        right_widget = QWidget()
+        right_widget.setFixedWidth(220)
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(12)
+
+        self.btn_new = QPushButton("New")
+        self.btn_new.clicked.connect(self._on_new_recipe)
+        self.btn_save = QPushButton("Save")
+        self.btn_save.clicked.connect(self._on_save_recipe)
+        self.btn_delete = QPushButton("Delete")
+        self.btn_delete.clicked.connect(self._on_delete_recipe)
+
+        right_layout.addWidget(self.btn_new)
+        right_layout.addWidget(self.btn_save)
+        right_layout.addWidget(self.btn_delete)
+        right_layout.addSpacing(30)
+
+        # Execute (full mode only)
+        self.btn_execute = None
+        self.btn_stop = None
+        if self.mode == 'full':
+            lbl_exec = QLabel("Execute")
+            lbl_exec.setStyleSheet("font-weight: bold;")
+            right_layout.addWidget(lbl_exec)
+
+            self.btn_execute = QPushButton("Run Recipe")
+            self.btn_execute.setMinimumHeight(55)
+            self.btn_execute.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+            self.btn_execute.clicked.connect(self._on_execute)
+            right_layout.addWidget(self.btn_execute)
+
+            self.btn_stop = QPushButton("Stop")
+            self.btn_stop.setMinimumHeight(55)
+            self.btn_stop.setEnabled(False)
+            self.btn_stop.setStyleSheet("background-color: #f44336; color: white; font-weight: bold;")
+            self.btn_stop.clicked.connect(self._on_stop)
+            right_layout.addWidget(self.btn_stop)
+            right_layout.addSpacing(25)
+
+        # Step controls
+        lbl_steps = QLabel("Steps")
+        lbl_steps.setStyleSheet("font-weight: bold;")
+        right_layout.addWidget(lbl_steps)
+
+        self.btn_remove_step = QPushButton("Remove")
+        self.btn_remove_step.clicked.connect(self._on_remove_step)
+        self.btn_move_up = QPushButton("Move Up")
+        self.btn_move_up.clicked.connect(lambda: self._on_reorder(-1))
+        self.btn_move_down = QPushButton("Move Down")
+        self.btn_move_down.clicked.connect(lambda: self._on_reorder(+1))
+        self.btn_clear_steps = QPushButton("Clear All")
+        self.btn_clear_steps.clicked.connect(self._on_clear_steps)
+
+        right_layout.addWidget(self.btn_remove_step)
+        right_layout.addWidget(self.btn_move_up)
+        right_layout.addWidget(self.btn_move_down)
+        right_layout.addWidget(self.btn_clear_steps)
+        right_layout.addStretch()
+
+        panel_layout.addWidget(left_widget, 1)
+        panel_layout.addWidget(right_widget, 0)
+
+        content_layout = QVBoxLayout()
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(panel)
+        box.setContentLayout(content_layout)
+
+        self.parent_layout.addWidget(box)
+        self.move_planner_group = box
+
+    # =========================
+    # Add steps
+    # =========================
+
+    def _on_use_current(self):
+        try:
+            x_fs = float(getattr(self.stepper.MOTORS, "x_current_position_full_step", 0.0))
+            y_fs = float(getattr(self.stepper.MOTORS, "y_current_position_full_step", 0.0))
+            z_fs = float(getattr(self.stepper.MOTORS, "z_current_position_full_step", 0.0))
+            self.x_us.setValue(int(round(x_fs * MRES)))
+            self.y_us.setValue(int(round(y_fs * MRES)))
+            self.z_us.setValue(int(round(z_fs * MRES)))
+        except Exception:
+            pass
+        self._set_status("Loaded current position.")
+
+    def _on_add_move_step(self):
+        step = RecipeStep(
+            step_type="move",
+            x_us=self.x_us.value(),
+            y_us=self.y_us.value(),
+            z_us=self.z_us.value(),
+            speed=self.speed_spin.value(),
+            dwell_ms=self.dwell_ms.value(),
+        )
+        self._add_step_to_table(step)
+        self._set_status("Added move step.")
+
+    def _on_add_microfluidics(self):
+        step = RecipeStep(
+            step_type="microfluidics",
+            dwell_ms=self.dwell_ms.value(),
+            note="Microfluidics routine",
+        )
+        self._add_step_to_table(step)
+        self._set_status("Added microfluidics step.")
+
+    def _on_add_spiral_scan(self):
+        step = RecipeStep(
+            step_type="spiral_scan",
+            dwell_ms=self.dwell_ms.value(),
+            note="Spiral scan",
+        )
+        self._add_step_to_table(step)
+        self._set_status("Added spiral scan step.")
+
+    def _add_step_to_table(self, step: RecipeStep):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self._set_table_row(r, step)
+        self.table.selectRow(r)
+
+    def _set_table_row(self, r: int, step: RecipeStep):
+        self.table.setItem(r, 0, QTableWidgetItem(str(r + 1)))
+
+        if step.step_type == "move":
+            type_item = QTableWidgetItem("Move")
+            self.table.setItem(r, 2, QTableWidgetItem(str(step.x_us)))
+            self.table.setItem(r, 3, QTableWidgetItem(str(step.y_us)))
+            self.table.setItem(r, 4, QTableWidgetItem(str(step.z_us)))
+            self.table.setItem(r, 5, QTableWidgetItem(f"x{step.speed:.2f}"))
+            self.table.setItem(r, 6, QTableWidgetItem(str(step.dwell_ms) if step.dwell_ms else ""))
+        elif step.step_type == "microfluidics":
+            type_item = QTableWidgetItem("µFluidics")
+            type_item.setBackground(Qt.GlobalColor.darkYellow)
+            for c in (2, 3, 4, 5):
+                self.table.setItem(r, c, QTableWidgetItem("—"))
+            self.table.setItem(r, 6, QTableWidgetItem(str(step.dwell_ms) if step.dwell_ms else ""))
+        elif step.step_type == "spiral_scan":
+            type_item = QTableWidgetItem("Scan")
+            type_item.setBackground(Qt.GlobalColor.darkBlue)
+            for c in (2, 3, 4, 5):
+                self.table.setItem(r, c, QTableWidgetItem("—"))
+            self.table.setItem(r, 6, QTableWidgetItem(str(step.dwell_ms) if step.dwell_ms else ""))
+
+        self.table.setItem(r, 1, type_item)
+
+        # Store the full step data as user data on the type item for retrieval
+        type_item.setData(Qt.ItemDataRole.UserRole, step.__dict__)
+
+    def _read_table_steps(self) -> List[RecipeStep]:
+        steps: List[RecipeStep] = []
+        for r in range(self.table.rowCount()):
+            type_item = self.table.item(r, 1)
+            if type_item is None:
+                continue
+            data = type_item.data(Qt.ItemDataRole.UserRole)
+            if data:
+                steps.append(RecipeStep(**data))
+            else:
+                # Legacy fallback: try reading as move step
+                try:
+                    x = int(self.table.item(r, 2).text())
+                    y = int(self.table.item(r, 3).text())
+                    z = int(self.table.item(r, 4).text())
+                    speed_text = self.table.item(r, 5).text().replace("x", "")
+                    speed = float(speed_text) if speed_text else 1.0
+                    dwell_text = self.table.item(r, 6).text()
+                    dwell = int(dwell_text) if dwell_text else 0
+                    steps.append(RecipeStep(step_type="move", x_us=x, y_us=y,
+                                            z_us=z, speed=speed, dwell_ms=dwell))
+                except Exception:
+                    pass
+        return steps
+
+    # =========================
+    # Step controls
+    # =========================
+
+    def _on_remove_step(self):
+        row = self._selected_row()
+        if row < 0:
+            return
+        self.table.removeRow(row)
+        self._renumber()
+
+    def _on_reorder(self, delta: int):
+        row = self._selected_row()
+        if row < 0:
+            return
+        new_row = row + int(delta)
+        if new_row < 0 or new_row >= self.table.rowCount():
+            return
+        # Read both steps
+        steps = self._read_table_steps()
+        steps[row], steps[new_row] = steps[new_row], steps[row]
+        # Re-render
+        self.table.setRowCount(0)
+        for i, st in enumerate(steps):
+            self.table.insertRow(i)
+            self._set_table_row(i, st)
+        self.table.selectRow(new_row)
+
+    def _on_clear_steps(self):
+        if QMessageBox.question(self, "Clear Steps", "Clear all steps?") != QMessageBox.StandardButton.Yes:
+            return
+        self.table.setRowCount(0)
+        self._set_status("Cleared steps.")
+
+    def _renumber(self):
+        for r in range(self.table.rowCount()):
+            if self.table.item(r, 0) is None:
+                self.table.setItem(r, 0, QTableWidgetItem(""))
+            self.table.item(r, 0).setText(str(r + 1))
+
+    def _selected_row(self) -> int:
+        items = self.table.selectedItems()
+        if not items:
+            return -1
+        return items[0].row()
+
+    def _set_status(self, msg: str):
+        self.status_lbl.setText(msg)
+
+    # =========================
+    # Recipe persistence
+    # =========================
+
+    def _load_recipes_from_disk(self):
+        self._recipes = {}
+        if not self.recipes_path or not os.path.exists(self.recipes_path):
+            self._set_status("No recipes file yet.")
+            return
+        try:
+            with open(self.recipes_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for name, blob in (data or {}).items():
+                steps = []
+                for st in blob.get("steps", []):
+                    # Handle both old format (x_fs) and new format (x_us)
+                    if "x_fs" in st and "x_us" not in st:
+                        # Legacy: convert full-steps to microsteps
+                        steps.append(RecipeStep(
+                            step_type=st.get("step_type", "move"),
+                            x_us=int(round(float(st.get("x_fs", 0)) * MRES)),
+                            y_us=int(round(float(st.get("y_fs", 0)) * MRES)),
+                            z_us=int(round(float(st.get("z_fs", 0)) * MRES)),
+                            speed=float(st.get("speed", 1.0)),
+                            dwell_ms=int(st.get("dwell_ms", 0) or 0),
+                            override_z_limit=bool(st.get("override_z_limit", False)),
+                            run_calibration_during_dwell=bool(
+                                st.get("run_calibration_during_dwell", False)),
+                            note=str(st.get("note", "") or ""),
+                        ))
+                    else:
+                        steps.append(RecipeStep(
+                            step_type=st.get("step_type", "move"),
+                            x_us=int(st.get("x_us", 0)),
+                            y_us=int(st.get("y_us", 0)),
+                            z_us=int(st.get("z_us", 0)),
+                            speed=float(st.get("speed", 1.0)),
+                            dwell_ms=int(st.get("dwell_ms", 0) or 0),
+                            override_z_limit=bool(st.get("override_z_limit", False)),
+                            run_calibration_during_dwell=bool(
+                                st.get("run_calibration_during_dwell", False)),
+                            note=str(st.get("note", "") or ""),
+                        ))
+                self._recipes[name] = MoveRecipe(name=name, steps=steps)
+        except Exception as e:
+            QMessageBox.warning(self, "Move Planner", f"Failed to load recipes:\n{e}")
+
+    def _save_recipes_to_disk(self):
+        try:
+            os.makedirs(os.path.dirname(self.recipes_path), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            out = {}
+            for name, r in self._recipes.items():
+                out[name] = {
+                    "name": r.name,
+                    "steps": [asdict(s) for s in r.steps]
+                }
+            with open(self.recipes_path, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "Move Planner", f"Failed to save recipes:\n{e}")
+
+    def _refresh_recipe_combo(self):
+        current = self.recipe_combo.currentText().strip()
+        self.recipe_combo.blockSignals(True)
+        self.recipe_combo.clear()
+        names = sorted(self._recipes.keys())
+        self.recipe_combo.addItems(names)
+        self.recipe_combo.blockSignals(False)
+        if current and current in self._recipes:
+            self.recipe_combo.setCurrentText(current)
+        elif names:
+            self.recipe_combo.setCurrentIndex(0)
+        else:
+            self._active_recipe_name = None
+            self.table.setRowCount(0)
+
+    def _render_recipe_steps(self, recipe: Optional[MoveRecipe]):
+        self.table.setRowCount(0)
+        if recipe is None:
+            return
+        for i, st in enumerate(recipe.steps):
+            self.table.insertRow(i)
+            self._set_table_row(i, st)
+
+    # =========================
+    # Recipe actions
+    # =========================
+
+    def _on_recipe_selected(self, name: str):
+        name = (name or "").strip()
+        if not name or name not in self._recipes:
+            self._active_recipe_name = None
+            self.table.setRowCount(0)
+            return
+        self._active_recipe_name = name
+        self._render_recipe_steps(self._recipes[name])
+
+    def _on_new_recipe(self):
+        if self._exec_active:
+            QMessageBox.information(self, "Planner", "Stop execution first.")
+            return
+        name = self.recipe_name_edit.text().strip()
+        if not name:
+            name, ok = QInputDialog.getText(self, "New Recipe", "Recipe name:")
+            if not ok:
+                return
+            name = name.strip()
+        if not name:
+            return
+        if name in self._recipes:
+            QMessageBox.warning(self, "Planner", f"'{name}' already exists.")
+            return
+        self._recipes[name] = MoveRecipe(name=name, steps=[])
+        self._save_recipes_to_disk()
+        self._refresh_recipe_combo()
+        self.recipe_combo.setCurrentText(name)
+        self.recipe_name_edit.clear()
+
+    def _on_save_recipe(self):
+        if self._exec_active:
+            QMessageBox.information(self, "Planner", "Stop execution first.")
+            return
+        name = self._active_recipe_name
+        typed = self.recipe_name_edit.text().strip()
+        if typed:
+            name = typed
+        if not name:
+            name, ok = QInputDialog.getText(self, "Save Recipe", "Recipe name:")
+            if not ok:
+                return
+            name = name.strip()
+        if not name:
+            return
+        steps = self._read_table_steps()
+        self._recipes[name] = MoveRecipe(name=name, steps=steps)
+        self._save_recipes_to_disk()
+        self._refresh_recipe_combo()
+        self.recipe_combo.setCurrentText(name)
+        self.recipe_name_edit.clear()
+        self._set_status(f"Saved '{name}' ({len(steps)} steps).")
+
+    def _on_delete_recipe(self):
+        if self._exec_active:
+            return
+        name = self.recipe_combo.currentText().strip()
+        if not name or name not in self._recipes:
+            return
+        if QMessageBox.question(self, "Delete", f"Delete '{name}'?") != QMessageBox.StandardButton.Yes:
+            return
+        del self._recipes[name]
+        self._save_recipes_to_disk()
+        self._refresh_recipe_combo()
+
+    # =========================
+    # Z-limit override
+    # =========================
+
+    def _override_z_limit(self):
+        """Temporarily raise z_global_max to allow high-Z moves."""
+        try:
+            motion = self.stepper.motion
+            self._saved_z_limit = motion._sb_z_global_max
+            motion._sb_z_global_max = 1200.0  # max possible
+            print(f"[Planner] Z limit overridden: {self._saved_z_limit} -> 1200")
+        except Exception as e:
+            print(f"[Planner] Z limit override failed: {e}")
+
+    def _restore_z_limit(self):
+        """Restore z_global_max to its original value."""
+        if self._saved_z_limit is not None:
+            try:
+                self.stepper.motion._sb_z_global_max = self._saved_z_limit
+                print(f"[Planner] Z limit restored: {self._saved_z_limit}")
+            except Exception:
+                pass
+            self._saved_z_limit = None
+
+    # =========================
+    # Execution
+    # =========================
+
+    def _on_execute(self):
+        if self.mode != 'full' or self.btn_execute is None:
+            return
+        if self._exec_active:
+            return
+        if self.table.rowCount() == 0:
+            QMessageBox.warning(self, "Planner", "Add at least one step.")
+            return
+        if not hasattr(self.stepper, "move_to_ctrl"):
+            QMessageBox.critical(self, "Planner", "No move controller.")
+            return
+        try:
+            if self.stepper.homing.is_active() or self.stepper.move_to_ctrl.is_active():
+                QMessageBox.information(self, "Busy", "Motors are already moving.")
+                return
+        except Exception:
+            pass
+
+        # Save current speed
+        try:
+            self._saved_speed_mult = self.stepper.mc.get_speed_multiplier()
+        except Exception:
+            self._saved_speed_mult = 1.0
+
+        self._exec_active = True
+        self._exec_index = -1
+        self._micro_seq_index = -1
+        if self.btn_execute:
+            self.btn_execute.setEnabled(False)
+        if self.btn_stop:
+            self.btn_stop.setEnabled(True)
+        self._set_status("Executing recipe...")
+        self._advance_exec_step()
+
+    def _on_stop(self):
+        if self.mode != 'full':
+            return
+        if not self._exec_active:
+            return
+        self._dwell_timer.stop()
+        self._countdown_timer.stop()
+        self._exec_active = False
+        self._exec_index = -1
+        self._micro_seq_index = -1
+        # Stop any running cal we kicked off during a dwell
+        self._cleanup_cal_during_dwell(stop_cal=True)
+        self._restore_z_limit()
+        # Restore speed
+        try:
+            self.stepper.mc.set_speed_multiplier(self._saved_speed_mult)
+        except Exception:
+            pass
+        try:
+            self.stepper._on_stop()
+        except Exception:
+            pass
+        if self.btn_execute:
+            self.btn_execute.setEnabled(True)
+        if self.btn_stop:
+            self.btn_stop.setEnabled(False)
+        self._set_status("Execution stopped.")
+
+    def _advance_exec_step(self):
+        if not self._exec_active:
+            return
+
+        # If we're in the middle of a microfluidics sub-sequence, continue it
+        if self._micro_seq_index >= 0:
+            self._advance_microfluidics()
+            return
+
+        self._exec_index += 1
+        steps = self._read_table_steps()
+
+        if self._exec_index >= len(steps):
+            self._finish_execution("Recipe complete.")
+            return
+
+        step = steps[self._exec_index]
+        self.table.selectRow(self._exec_index)
+
+        if step.step_type == "move":
+            self._execute_move_step(step)
+        elif step.step_type == "microfluidics":
+            self._pending_dwell_ms = step.dwell_ms
+            self._pending_cal_during_dwell = False  # outer wrapper has no cal flag
+            self._micro_seq_index = 0
+            self._set_status(f"Step {self._exec_index + 1}: Microfluidics...")
+            self._advance_microfluidics()
+        elif step.step_type == "spiral_scan":
+            self._pending_dwell_ms = step.dwell_ms
+            self._pending_cal_during_dwell = False
+            self._set_status(f"Step {self._exec_index + 1}: Spiral Scan...")
+            # TODO: integrate with SpiralScanController
+            # For now, skip with a warning
+            print("[Planner] Spiral scan step — not yet integrated")
+            self._set_status("Spiral scan: not yet integrated, skipping...")
+            self._handle_dwell_or_advance()
+
+    def _execute_move_step(self, step: RecipeStep):
+        """Execute a single move step."""
+        x_fs = float(step.x_us) / MRES
+        y_fs = float(step.y_us) / MRES
+        z_fs = float(step.z_us) / MRES
+
+        self._pending_dwell_ms = step.dwell_ms
+        self._pending_cal_during_dwell = bool(
+            getattr(step, "run_calibration_during_dwell", False))
+
+        # Override Z limit if needed
+        if step.override_z_limit:
+            self._override_z_limit()
+        else:
+            self._restore_z_limit()
+
+        # Set speed for this step
+        try:
+            self.stepper.mc.set_speed_multiplier(step.speed)
+        except Exception:
+            pass
+
+        self._set_status(
+            f"Step {self._exec_index + 1}: Move ({step.x_us},{step.y_us},{step.z_us}) "
+            f"x{step.speed:.2f}"
+        )
+
+        try:
+            self.stepper._preempt_all_motion()
+            self.stepper._all_btn_enabled(False)
+            self.stepper.move_to_ctrl.start(x_fs, y_fs, z_fs)
+        except Exception as e:
+            self._restore_z_limit()
+            self._finish_execution(f"Move failed: {e}")
+
+    # =========================
+    # Microfluidics sub-sequence
+    # =========================
+
+    def _advance_microfluidics(self):
+        """Execute the next step in the microfluidics sub-sequence."""
+        if not self._exec_active:
+            return
+        if self._micro_seq_index >= len(MICROFLUIDICS_SEQUENCE):
+            # Sub-sequence complete
+            self._micro_seq_index = -1
+            self._restore_z_limit()
+            self._set_status(f"Step {self._exec_index + 1}: Microfluidics complete.")
+            self._handle_dwell_or_advance()
+            return
+
+        sub_step = MICROFLUIDICS_SEQUENCE[self._micro_seq_index]
+        self._micro_seq_index += 1
+
+        self._set_status(
+            f"Step {self._exec_index + 1}: µFluidics "
+            f"[{self._micro_seq_index}/{len(MICROFLUIDICS_SEQUENCE)}]"
+        )
+
+        self._execute_move_step(sub_step)
+
+    # =========================
+    # Move completion handler
+    # =========================
+
+    def _on_move_to_finished(self, success: bool, message: str):
+        if not self._exec_active:
+            return
+
+        # If a dwell is currently running, this move-finished is from
+        # something OTHER than our recipe (e.g. orientation calibration
+        # moving the stage during the dwell). The dwell timer / cal-finished
+        # signal is in charge of advancing — not move_to_ctrl.
+        if self._dwell_timer.isActive() or self._waiting_for_cal \
+                or self._cal_running_for_step:
+            return
+
+        if not success:
+            self._restore_z_limit()
+            try:
+                self.stepper.mc.set_speed_multiplier(self._saved_speed_mult)
+            except Exception:
+                pass
+            self._finish_execution(message or "Move failed.")
+            return
+
+        # If in microfluidics sub-sequence, check dwell then advance
+        if self._micro_seq_index >= 0:
+            dwell_ms = int(getattr(self, "_pending_dwell_ms", 0) or 0)
+            if dwell_ms > 0:
+                self._start_dwell(dwell_ms)
+                return
+            self._advance_microfluidics()
+            return
+
+        # Normal move step complete
+        self._handle_dwell_or_advance()
+
+    def _handle_dwell_or_advance(self):
+        dwell_ms = int(getattr(self, "_pending_dwell_ms", 0) or 0)
+        if dwell_ms > 0:
+            self._start_dwell(dwell_ms)
+        else:
+            self._advance_exec_step()
+
+    def _start_dwell(self, dwell_ms: int):
+        """Start a dwell. If the step requested calibration during the dwell,
+        kick it off in parallel — the visible countdown timer is unaffected
+        and continues to display remaining dwell time as usual."""
+        self._dwell_remaining_ms = dwell_ms
+        self._pending_dwell_ms = 0
+        self._update_countdown()
+        self._countdown_timer.start()
+        self._dwell_timer.start(dwell_ms)
+
+        if self._pending_cal_during_dwell:
+            self._pending_cal_during_dwell = False
+            self._kick_off_calibration_during_dwell()
+
+    def _kick_off_calibration_during_dwell(self):
+        """Start orientation calibration in parallel with the dwell."""
+        if self._orient_cal is None:
+            print("[Planner] run_calibration_during_dwell requested but no "
+                  "orient_cal controller wired up — skipping cal, dwell continues.")
+            return
+        if self._orient_cal.is_active():
+            print("[Planner] Calibration already active when dwell started; "
+                  "tracking it as the dwell's calibration.")
+            self._cal_running_for_step = True
+            try:
+                self._orient_cal.finished.connect(self._on_dwell_calibration_finished)
+            except Exception:
+                pass
+            return
+
+        # Resolve camera settings
+        settings = {}
+        try:
+            if callable(self._camera_settings_provider):
+                settings = self._camera_settings_provider() or {}
+        except Exception as e:
+            print(f"[Planner] Camera settings provider failed: {e}")
+            settings = {}
+
+        # Connect first so we don't miss a fast finish
+        try:
+            self._orient_cal.finished.connect(self._on_dwell_calibration_finished)
+        except Exception:
+            pass
+
+        # Set the flag BEFORE calling start(), because start() can synchronously
+        # emit `finished` if (e.g.) live preview isn't running. If we set the
+        # flag after, the slot would see _cal_running_for_step=False and ignore
+        # the failure.
+        self._cal_running_for_step = True
+        try:
+            self._orient_cal.start(settings)
+            print("[Planner] Orientation calibration started during dwell.")
+        except Exception as e:
+            self._cal_running_for_step = False
+            print(f"[Planner] Failed to start calibration during dwell: {e}")
+            try:
+                self._orient_cal.finished.disconnect(self._on_dwell_calibration_finished)
+            except Exception:
+                pass
+
+    def _on_dwell_timeout(self):
+        """Dwell timer expired. If a calibration we kicked off is still
+        running, hold off advancing until cal finishes. Otherwise advance."""
+        self._countdown_timer.stop()
+        if self._cal_running_for_step and self._orient_cal is not None \
+                and self._orient_cal.is_active():
+            self._waiting_for_cal = True
+            # Status hint, but we don't touch the countdown label format —
+            # remaining time has reached zero, so this just sits at 00:00.
+            self._set_status(
+                f"Step {self._exec_index + 1}: dwell complete, "
+                f"waiting for calibration to finish..."
+            )
+            return
+        self._advance_after_dwell()
+
+    def _on_dwell_calibration_finished(self, *args):
+        """Slot for orient_cal.finished. Signature is (success, message, result)
+        but we accept *args defensively."""
+        try:
+            self._orient_cal.finished.disconnect(self._on_dwell_calibration_finished)
+        except Exception:
+            pass
+
+        if not self._cal_running_for_step:
+            return  # not ours to handle
+
+        success = bool(args[0]) if len(args) >= 1 else False
+        message = str(args[1]) if len(args) >= 2 else ""
+        self._cal_running_for_step = False
+
+        # The cal completion path goes through RecordSetupScreen._on_orient_cal_finished
+        # → stepper.end_calibration() → _all_btn_enabled(True), which re-enables
+        # all motor buttons even though the recipe is still running. Re-disable
+        # them here so the user can't poke the stage during the rest of the dwell.
+        if self._exec_active:
+            try:
+                self.stepper._all_btn_enabled(False)
+            except Exception:
+                pass
+
+        if not self._waiting_for_cal:
+            # Cal finished while dwell still running — let the dwell finish on its own
+            print(f"[Planner] Calibration finished during dwell "
+                  f"(success={success}): {message}")
+            return
+
+        # Dwell already expired and we were holding — advance now
+        self._waiting_for_cal = False
+        print(f"[Planner] Calibration finished, releasing dwell hold "
+              f"(success={success}): {message}")
+        self._advance_after_dwell()
+
+    def _advance_after_dwell(self):
+        """_advance_exec_step routes to microfluidics if we're in a sub-sequence
+        (it checks _micro_seq_index >= 0 first)."""
+        if not self._exec_active:
+            return
+        self._advance_exec_step()
+
+    def _cleanup_cal_during_dwell(self, stop_cal: bool):
+        """Disconnect our cal-finished slot and optionally stop the running cal."""
+        if self._orient_cal is not None:
+            try:
+                self._orient_cal.finished.disconnect(self._on_dwell_calibration_finished)
+            except Exception:
+                pass
+            if stop_cal:
+                try:
+                    if self._orient_cal.is_active():
+                        self._orient_cal.stop("Recipe stopped")
+                except Exception:
+                    pass
+        self._cal_running_for_step = False
+        self._waiting_for_cal = False
+
+    def _update_countdown(self):
+        remaining = self._dwell_remaining_ms
+        if remaining <= 0:
+            self._countdown_timer.stop()
+            return
+        mins = remaining // 60000
+        secs = (remaining % 60000) // 1000
+        self._set_status(f"Step {self._exec_index + 1}: waiting {mins:02d}:{secs:02d}")
+        self._dwell_remaining_ms -= 1000
+
+    def _finish_execution(self, msg: str):
+        self._dwell_timer.stop()
+        self._countdown_timer.stop()
+        self._exec_active = False
+        self._exec_index = -1
+        self._micro_seq_index = -1
+        # Disconnect our cal slot but don't stop a running cal — if it's still
+        # going when the recipe ends naturally, let it finish.
+        self._cleanup_cal_during_dwell(stop_cal=False)
+        self._restore_z_limit()
+        # Restore speed
+        try:
+            self.stepper.mc.set_speed_multiplier(self._saved_speed_mult)
+        except Exception:
+            pass
+        if self.btn_execute:
+            self.btn_execute.setEnabled(True)
+        if self.btn_stop:
+            self.btn_stop.setEnabled(False)
+        self._set_status(msg)

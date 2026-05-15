@@ -1,0 +1,10 @@
+Image: 2026.03.09/2026.03.09_21.45.46_image.jpg (4056x3040)
+Threshold: 50
+Components: 40
+Clusters: 4
+Markers: 4
+
+(1,1) px=(3348,571) conf=1.546
+(2,1) px=(789,603) conf=1.529
+(1,2) px=(3369,2499) conf=1.568
+(2,2) px=(810,2533) conf=1.605

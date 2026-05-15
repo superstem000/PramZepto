@@ -1,0 +1,42 @@
+{
+  "test2": {
+    "name": "test2",
+    "steps": [
+      {
+        "step_type": "move",
+        "x_us": 3200,
+        "y_us": 3200,
+        "z_us": 0,
+        "speed": 0.01,
+        "dwell_ms": 0,
+        "override_z_limit": false,
+        "note": ""
+      },
+      {
+        "step_type": "move",
+        "x_us": 3200,
+        "y_us": 3200,
+        "z_us": 0,
+        "speed": 0.01,
+        "dwell_ms": 0,
+        "override_z_limit": false,
+        "note": ""
+      }
+    ]
+  },
+  "microfluidics test": {
+    "name": "microfluidics test",
+    "steps": [
+      {
+        "step_type": "microfluidics",
+        "x_us": 0,
+        "y_us": 0,
+        "z_us": 0,
+        "speed": 1.0,
+        "dwell_ms": 0,
+        "override_z_limit": false,
+        "note": "Microfluidics routine"
+      }
+    ]
+  }
+}
