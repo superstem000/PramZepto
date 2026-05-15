@@ -1223,6 +1223,26 @@ class MovePlannerWidget(QWidget):
         # flag after, the slot would see _cal_running_for_step=False and ignore
         # the failure.
         self._cal_running_for_step = True
+
+        # Defer the actual start to the next event-loop iteration. We are
+        # reached from inside a move_to_ctrl.finished emission (the dwell
+        # step's move completing — often "already-at-target", which fires
+        # `finished` synchronously). orient_cal.start() flips the controller
+        # active and synchronously issues its own move_to_ctrl.start(); if we
+        # did that here, OrientCal's own _on_move_finished slot — invoked
+        # later in the SAME finished emission — would mistake that stale
+        # signal for its move-to-center completing and kick off the XY move +
+        # autofocus a second time. Deferring lets the in-flight emission fully
+        # drain (with the controller still inactive) before cal begins.
+        QTimer.singleShot(0, lambda s=settings: self._deferred_cal_start(s))
+
+    def _deferred_cal_start(self, settings):
+        """Start orient cal on a clean stack (see _kick_off_calibration_during_dwell).
+        Bail if the recipe was stopped before this fired."""
+        if not self._exec_active or not self._cal_running_for_step:
+            return
+        if self._orient_cal is None:
+            return
         try:
             self._orient_cal.start(settings)
             print("[Planner] Orientation calibration started during dwell.")

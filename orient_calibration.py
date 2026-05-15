@@ -263,6 +263,7 @@ class OrientCalibrationController(QObject):
         self._phase = 'idle'
         self._camera_settings = {}
         self._saved_speed_mult = 1.0
+        self._af_kickoff_pending = False
 
         # Orientation
         self._orientation = load_orientation(config) if config else "normal"
@@ -335,6 +336,7 @@ class OrientCalibrationController(QObject):
 
         self._active = True
         self._stop_requested = False
+        self._af_kickoff_pending = False
         self._camera_settings = camera_settings
         self._row_scan_data = []
         self._col_scan_data = []
@@ -455,6 +457,16 @@ class OrientCalibrationController(QObject):
     def _start_autofocus(self):
         if self._stop_requested:
             return
+        # Idempotency guard: this is only ever scheduled from the
+        # 'move_to_center' branch of _on_move_finished. If a duplicate /
+        # stale move_to_ctrl.finished slipped through and scheduled this
+        # twice, the second invocation will see phase already advanced —
+        # ignore it so calibration AF isn't started on top of itself.
+        if self._phase != 'move_to_center':
+            print(f"[OrientCal id={id(self)}] _start_autofocus ignored "
+                  f"(phase={self._phase}, not move_to_center)")
+            return
+        self._af_kickoff_pending = False
         print(f"[OrientCal id={id(self)}] _start_autofocus fired, phase was {self._phase}")
         self._phase = 'initial_af'
         self.progress.emit('af', 'Calibration AF (Z=100..200)...')
@@ -1350,6 +1362,11 @@ class OrientCalibrationController(QObject):
             return
 
         if self._phase == 'move_to_center':
+            if self._af_kickoff_pending:
+                print(f"[OrientCal id={id(self)}] move_to_center finished "
+                      f"ignored — autofocus kickoff already pending")
+                return
+            self._af_kickoff_pending = True
             QTimer.singleShot(SETTLE_MS, self._start_autofocus)
 
         elif self._phase == 'row_scan_move':
