@@ -63,23 +63,23 @@ class MoveRecipe:
 
 MICROFLUIDICS_SEQUENCE = [
     # Move to push position 1
-    RecipeStep(step_type="move", x_us=35867, y_us=17100, z_us=22589,
+    RecipeStep(step_type="move", x_us=35867, y_us=19270, z_us=22589,
                speed=2.67, override_z_limit=True),
     # Fast approach
-    RecipeStep(step_type="move", x_us=21000, y_us=17100, z_us=22589,
+    RecipeStep(step_type="move", x_us=21000, y_us=19270, z_us=22589,
                speed=2.67, override_z_limit=True),
     # Slow push
-    RecipeStep(step_type="move", x_us=10677, y_us=17100, z_us=22589,
+    RecipeStep(step_type="move", x_us=10677, y_us=19270, z_us=22589,
                speed=0.02, override_z_limit=True),
     # Fast retract
-    RecipeStep(step_type="move", x_us=35867, y_us=17100, z_us=22589,
+    RecipeStep(step_type="move", x_us=35867, y_us=19270, z_us=22589,
                speed=2.67, override_z_limit=True),
     # 1-hour wait between pushes — orient calibration runs in parallel during
     # the dwell. If cal takes longer than 1 hour, planner waits for it to
     # finish before advancing to push 2.
-    RecipeStep(step_type="move", x_us=35867, y_us=17100, z_us=22589,
+    RecipeStep(step_type="move", x_us=35867, y_us=19270, z_us=22589,
                speed=2.67, override_z_limit=True,
-               dwell_ms=60 * 60 * 1000,
+               dwell_ms=60 * 60 * 1000, #*************************************************************
                run_calibration_during_dwell=True,
                note="1 hour wait between pushes (calibration runs in parallel)"),
     # Move to push position 2
@@ -94,7 +94,7 @@ MICROFLUIDICS_SEQUENCE = [
     # Fast retract — then 20-minute settle wait before final Z retract
     RecipeStep(step_type="move", x_us=35867, y_us=36986, z_us=22589,
                speed=2.67, override_z_limit=True,
-               #dwell_ms=20 * 60 * 1000,
+               #dwell_ms=20 * 60 * 1000, #***************************************************************
                note="Settle 20 min before final Z retract"),
     # Final Z retract
     RecipeStep(step_type="move", x_us=35867, y_us=36986, z_us=0,

@@ -469,7 +469,7 @@ class OrientCalibrationController(QObject):
         self._af_kickoff_pending = False
         print(f"[OrientCal id={id(self)}] _start_autofocus fired, phase was {self._phase}")
         self._phase = 'initial_af'
-        self.progress.emit('af', 'Calibration AF (Z=100..200)...')
+        self.progress.emit('af', 'Calibration AF (Z=130..200)...')
         if self.af_controller:
             # Wide-sweep calibration AF: stage 1 sweeps Z=100..200 at 1.5fs,
             # subsequent stages refine, and the final best Z is persisted to
