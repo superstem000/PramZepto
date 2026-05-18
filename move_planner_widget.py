@@ -1060,8 +1060,72 @@ class MovePlannerWidget(QWidget):
             f"(center=({center_col},{center_row}), interval={interval_min}min)..."
         )
 
+        # ── Quiesce barrier ──
+        # Cal-during-dwell (OrientCal) runs in parallel and its AF drives Z
+        # directly via mc.set_speed_fullstep, bypassing MoveTo. If it is still
+        # winding down when the scan's startup move begins, XY (MoveTo) and Z
+        # (AF) move at once, outside the motion-safety layer. Stop it and wait
+        # for every motion controller to report idle before starting the scan.
         try:
-            self._spiral_scan.start(camera_settings)
+            self._cleanup_cal_during_dwell(stop_cal=True)
+        except Exception:
+            pass
+        try:
+            self.stepper._preempt_all_motion()
+        except Exception:
+            pass
+
+        self._pending_spiral_camera_settings = camera_settings
+        self._spiral_quiesce_polls = 0
+        if getattr(self, "_spiral_quiesce_timer", None) is None:
+            self._spiral_quiesce_timer = QTimer(self)
+            self._spiral_quiesce_timer.setInterval(100)
+            self._spiral_quiesce_timer.timeout.connect(self._poll_spiral_quiesce)
+        self._set_status(
+            f"Step {self._exec_index + 1}: Spiral Scan — waiting for "
+            f"calibration/motion to settle..."
+        )
+        self._spiral_quiesce_timer.start()
+
+    # Max wait for cal/motion to settle before starting the scan anyway
+    # (100ms poll * 40 = 4s). Bounded so a stuck controller can't hang the recipe.
+    SPIRAL_QUIESCE_MAX_POLLS = 40
+
+    def _poll_spiral_quiesce(self):
+        """Wait until OrientCal/AF/homing/MoveTo all report idle, then start
+        the spiral scan. The cal-during-dwell AF drives Z directly outside the
+        safety layer, so starting the scan's move while it is still active
+        causes simultaneous unsafe XY+Z motion."""
+        if not self._exec_active or not self._spiral_scan_running_for_step:
+            self._spiral_quiesce_timer.stop()
+            return
+
+        busy = False
+        try:
+            if self._orient_cal is not None and self._orient_cal.is_active():
+                busy = True
+            if self.stepper.homing.is_active() or self.stepper.move_to_ctrl.is_active():
+                busy = True
+            af = getattr(self._spiral_scan, "af_controller", None)
+            if af is not None and af.is_active():
+                busy = True
+        except Exception:
+            pass
+
+        self._spiral_quiesce_polls += 1
+        timed_out = self._spiral_quiesce_polls >= self.SPIRAL_QUIESCE_MAX_POLLS
+        if busy and not timed_out:
+            return
+
+        self._spiral_quiesce_timer.stop()
+        if busy and timed_out:
+            print("[Planner] WARNING: cal/motion still active after quiesce "
+                  "timeout — starting spiral scan anyway")
+        else:
+            print("[Planner] Quiesce complete (motion idle) — starting spiral scan.")
+
+        try:
+            self._spiral_scan.start(self._pending_spiral_camera_settings)
             print(f"[Planner] Spiral scan started for recipe step.")
         except Exception as e:
             print(f"[Planner] spiral_scan.start failed: {e}")
