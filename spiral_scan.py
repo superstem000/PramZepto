@@ -220,18 +220,41 @@ class SpiralScanController(QObject):
             pass
 
     def _check_move_cap(self, dx_fs, dy_fs):
-        """Check if an XY move exceeds the 2-tile cap. Returns True if BLOCKED."""
+        """Reject an XY move if it would land outside the active scan/travel
+        bounds (primary) or exceeds the 3-tile magnitude cap (backup).
+        Returns True if BLOCKED."""
         if not self._scan_move_cap_active:
             return False
         cal = self.calibration.get_result()
         if not cal.valid:
             return False
+
+        # Primary: a target outside the scanned region can only come from a
+        # bad anchor/detection. Never issue it — the motion layer would
+        # silently clamp the axis and MoveTo would stall instead of recover.
+        try:
+            lim = self.move_to_ctrl.motion.limits
+            cur_x = float(getattr(self.MOTORS, "x_current_position_full_step", 0.0))
+            cur_y = float(getattr(self.MOTORS, "y_current_position_full_step", 0.0))
+            tgt_x = cur_x + float(dx_fs)
+            tgt_y = cur_y + float(dy_fs)
+            eps = 1e-6
+            if (tgt_x < lim.x0 - eps or tgt_x > lim.x1 + eps or
+                    tgt_y < lim.y0 - eps or tgt_y > lim.y1 + eps):
+                print(f"[DemoScan] MOVE CAP: target ({tgt_x:.1f},{tgt_y:.1f})fs "
+                      f"outside scan bounds X[{lim.x0:.1f},{lim.x1:.1f}] "
+                      f"Y[{lim.y0:.1f},{lim.y1:.1f}] — blocked")
+                return True
+        except Exception:
+            pass
+
+        # Backup: >3 tiles of correction in a single move ⇒ bad anchor.
         col_fs = cal.grid_pitch_col_fs
         row_fs = cal.grid_pitch_row_fs
         max_x_per_tile = max(abs(col_fs[0]), abs(row_fs[0]))
         max_y_per_tile = max(abs(col_fs[1]), abs(row_fs[1]))
-        limit_x = max_x_per_tile * 4.0
-        limit_y = max_y_per_tile * 4.0
+        limit_x = max_x_per_tile * 3.0
+        limit_y = max_y_per_tile * 3.0
         if abs(dx_fs) > limit_x or abs(dy_fs) > limit_y:
             print(f"[DemoScan] MOVE CAP: blocked ({dx_fs:.1f},{dy_fs:.1f})fs, "
                   f"limit ({limit_x:.1f},{limit_y:.1f})fs")
@@ -832,9 +855,25 @@ class SpiralScanController(QObject):
         if error_mag > 2.0:
             self._recovery_attempts += 1
 
+            # Bounded blind-nudge loop: too many non-converging nudges ⇒
+            # hand off to escalating AF, which can widen half-indefinitely.
+            if self._recovery_attempts > self.MAX_RECOVERY_ATTEMPTS:
+                print(f"[DemoScan] Fine correction not converging after "
+                      f"{self.MAX_RECOVERY_ATTEMPTS} attempts "
+                      f"(err {error_mag:.1f}fs) — AF and retry")
+                self._recovery_attempts = 0
+                self._consecutive_af_failures += 1
+                self._state = 'sanity_af'
+                self._after_move_cb = lambda: QTimer.singleShot(
+                    self.SETTLE_MS, lambda: self._fine_correct(callback))
+                self._start_escalating_af()
+                return
+
             # Check move cap before executing correction
             if self._check_move_cap(error_fs[0], error_fs[1]):
                 print(f"[DemoScan] Fine correction blocked by move cap — AF and retry")
+                self._recovery_attempts = 0
+                self._consecutive_af_failures += 1
                 self._state = 'sanity_af'
                 self._after_move_cb = lambda: QTimer.singleShot(
                     self.SETTLE_MS, lambda: self._fine_correct(callback))
