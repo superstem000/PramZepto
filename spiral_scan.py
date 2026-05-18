@@ -96,6 +96,8 @@ class SpiralScanController(QObject):
     MAX_RECOVERY_ATTEMPTS = 3
     MOVE_SANITY_FACTOR = 1.8
     WALK_JUMP_SIZE = 2
+    WALK_ESCALATE_NO_PROGRESS = 4   # full AF after this many stalled walk checks
+    WALK_MAX_NO_PROGRESS = 8        # abort walk if still stuck after this many
     AF_EVERY_N_TILES = 2
     LEARN_RATE = 0.02
     DZ_PER_COL = -0.220
@@ -139,6 +141,8 @@ class SpiralScanController(QObject):
         self._last_good_z = 0.0  # ADDED: Z position at last successful detection
         self._tiles_since_af = 0
         self._last_move_was_noop = False
+        self._walk_no_progress = 0
+        self._walk_last_infer = None
         self._spiral_path: List[Tuple[int, int]] = []
         self._spiral_idx = 0
         self._camera_settings = {}
@@ -587,12 +591,31 @@ class SpiralScanController(QObject):
         motor_delta, mag = self._compute_move_delta(cal, ref_m, dcol, drow, markers=markers)
 
         if mag < self.SKIP_THRESHOLD_FS:
+            # The "already there" shortcut is only trustworthy with a real,
+            # nearby anchor. With a virtual (extrapolated) anchor, a sub-
+            # threshold magnitude is a degenerate-geometry artifact, not
+            # genuine arrival: honoring it performs no physical motion, so the
+            # camera view never changes, inference stays pinned to the same
+            # tile, and the walk loop livelocks (AF spins forever). For a real
+            # tile step off a virtual anchor, move by the clean expected grid
+            # displacement so the stage actually translates and inference can
+            # re-converge.
+            if exact:
+                print(f"[DemoScan] ({cur_col},{cur_row})->({target_col},{target_row}) "
+                      f"only {mag:.1f}fs, already there")
+                self._current_target = (target_col, target_row)
+                self._last_move_was_noop = True
+                QTimer.singleShot(10, callback)
+                return (cur_col, cur_row)
+            obs_col_px, obs_row_px = measure_pixel_pitch_from_markers(markers)
+            col_px = obs_col_px if obs_col_px is not None else cal.grid_pitch_col_px
+            row_px = obs_row_px if obs_row_px is not None else cal.grid_pitch_row_px
+            grid_dpx = dcol * col_px + drow * row_px
+            motor_delta = cal.px_to_motor @ (-grid_dpx)
+            mag = float(np.linalg.norm(motor_delta))
             print(f"[DemoScan] ({cur_col},{cur_row})->({target_col},{target_row}) "
-                  f"only {mag:.1f}fs, already there")
-            self._current_target = (target_col, target_row)
-            self._last_move_was_noop = True
-            QTimer.singleShot(10, callback)
-            return (cur_col, cur_row)
+                  f"virtual anchor sub-threshold — forcing grid step "
+                  f"mag={mag:.1f}fs")
 
         # Global move cap: if active, block any XY move exceeding 2 tiles per axis
         if self._check_move_cap(motor_delta[0], motor_delta[1]):
@@ -1018,6 +1041,8 @@ class SpiralScanController(QObject):
         self._walk_target_col = target_col
         self._walk_target_row = target_row
         self._walk_final_cb = callback
+        self._walk_no_progress = 0
+        self._walk_last_infer = None
         self._walk_step()
 
     def _walk_step(self):
@@ -1040,7 +1065,27 @@ class SpiralScanController(QObject):
                 self._last_known_col = self._walk_target_col
                 self._last_known_row = self._walk_target_row
                 self._last_z_correct_pos = (self._walk_target_col, self._walk_target_row)
+                self._walk_no_progress = 0
                 QTimer.singleShot(10, self._walk_final_cb)
+                return
+            # Stall safety net: inferred position not advancing toward target.
+            if (cur_col, cur_row) == self._walk_last_infer:
+                self._walk_no_progress += 1
+            else:
+                self._walk_no_progress = 0
+                self._walk_last_infer = (cur_col, cur_row)
+            if self._walk_no_progress >= self.WALK_MAX_NO_PROGRESS:
+                self.stop(f"Walk stalled at ({cur_col},{cur_row}) — "
+                          f"cannot reach ({self._walk_target_col},"
+                          f"{self._walk_target_row})")
+                return
+            if self._walk_no_progress >= self.WALK_ESCALATE_NO_PROGRESS:
+                print(f"[DemoScan] Walk no progress x{self._walk_no_progress} "
+                      f"at ({cur_col},{cur_row}) — escalating AF")
+                self._consecutive_af_failures += 1
+                self._state = 'walk_af'
+                self._after_move_cb = self._walk_step
+                self._start_escalating_af()
                 return
         # Not there yet — AF then continue
         self._state = 'walk_af'
