@@ -1,3 +1,5 @@
+import os
+from datetime import datetime
 import numpy as np
 import cv2
 from typing import List, Dict, Optional
@@ -252,6 +254,25 @@ def detect_markers(rgb: np.ndarray, threshold: int = DEFAULT_THRESHOLD, debug: b
         m = fit_grid_to_cluster(c, binary, eroded, debug)
         if m: markers.append(m)
     return markers
+
+FAILED_IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "failed_images")
+
+def save_failed_frame(frame: np.ndarray, tag: str = "") -> Optional[str]:
+    """Save a frame that failed marker detection to ./failed_images/ for offline diagnosis."""
+    if frame is None:
+        return None
+    try:
+        os.makedirs(FAILED_IMAGES_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        suffix = f"_{tag}" if tag else ""
+        path = os.path.join(FAILED_IMAGES_DIR, f"fail_{ts}{suffix}.jpg")
+        from PIL import Image
+        Image.fromarray(frame).save(path, quality=90)
+        return path
+    except Exception as e:
+        print(f"[save_failed_frame] error: {e}")
+        return None
+
 
 if __name__ == '__main__':
     import sys

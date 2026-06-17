@@ -30,7 +30,7 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
-from feature_detection import detect_markers
+from feature_detection import detect_markers, save_failed_frame
 from stage_calibration import (
     CalibrationResult, measure_pixel_pitch_from_markers,
     save_calibration, load_calibration, _cal_path
@@ -493,6 +493,8 @@ class OrientCalibrationController(QObject):
 
         markers = self._detect_raw(frame)
         if not markers:
+            p = save_failed_frame(frame, "orient_reference")
+            print(f"[OrientCal] No markers at safe center — saved {p}")
             self.stop("No markers visible at safe center.")
             return
 
@@ -826,6 +828,8 @@ class OrientCalibrationController(QObject):
             return
         markers = self._detect_corrected(frame)
         if not markers:
+            p = save_failed_frame(frame, "orient_refine_begin")
+            print(f"[OrientCal] Refine begin: no markers — saved {p}")
             self._start_z_tilt_survey()
             return
 
@@ -874,6 +878,8 @@ class OrientCalibrationController(QObject):
             return
         markers = self._detect_corrected(frame)
         if not markers:
+            p = save_failed_frame(frame, "orient_refine_predict")
+            print(f"[OrientCal] Refine predict: no markers — saved {p}")
             self._refine_idx += 1
             self._refine_detect_and_move()
             return
@@ -899,6 +905,8 @@ class OrientCalibrationController(QObject):
             return
         markers = self._detect_corrected(frame)
         if not markers:
+            p = save_failed_frame(frame, "orient_refine_capture")
+            print(f"[OrientCal] Refine capture: no markers — saved {p}")
             self._refine_idx += 1
             self._refine_return_to_start()
             return

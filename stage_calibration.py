@@ -32,7 +32,7 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
-from feature_detection import detect_markers
+from feature_detection import detect_markers, save_failed_frame
 
 
 def measure_pixel_pitch_from_markers(markers):
@@ -411,6 +411,8 @@ class StageCalibration(QObject):
 
         markers = detect_markers(frame, threshold=self.DETECTION_THRESHOLD, debug=True)
         if not markers:
+            p = save_failed_frame(frame, "cal_initial")
+            print(f"[Cal] No markers visible — saved {p}")
             self._active = False
             self.finished.emit(False, "No markers visible.", None)
             return
@@ -551,6 +553,8 @@ class StageCalibration(QObject):
 
         markers = detect_markers(frame, threshold=self.DETECTION_THRESHOLD, debug=True)
         if not markers:
+            p = save_failed_frame(frame, "cal_reference")
+            print(f"[Cal] No markers at reference position — saved {p}")
             self.stop("No markers at reference position.")
             return
 
@@ -580,6 +584,8 @@ class StageCalibration(QObject):
 
         markers = detect_markers(frame, threshold=self.DETECTION_THRESHOLD, debug=True)
         if not markers:
+            p = save_failed_frame(frame, f"cal_probe_{axis_label}")
+            print(f"[Cal] No markers after {axis_label} probe — saved {p}")
             self.stop(f"No markers after {axis_label} probe.")
             return None
 
@@ -702,6 +708,8 @@ class StageCalibration(QObject):
 
         markers = detect_markers(frame, threshold=self.DETECTION_THRESHOLD)
         if not markers:
+            p = save_failed_frame(frame, "cal_refine_predict")
+            print(f"[Cal] Refine predict: no markers — saved {p}")
             self._refine_idx += 1
             self._move_to_refine_target()
             return
@@ -751,6 +759,8 @@ class StageCalibration(QObject):
 
         markers = detect_markers(frame, threshold=self.DETECTION_THRESHOLD)
         if not markers:
+            p = save_failed_frame(frame, "cal_refine_capture")
+            print(f"[Cal] Refine capture: no markers — saved {p}")
             self._refine_idx += 1
             self._move_to_refine_target()
             return
@@ -908,7 +918,8 @@ class StageCalibration(QObject):
 
         markers = detect_markers(frame, threshold=self.DETECTION_THRESHOLD)
         if not markers:
-            print(f"[Cal] Z-tilt: no markers, skipping tile")
+            p = save_failed_frame(frame, "cal_ztilt")
+            print(f"[Cal] Z-tilt: no markers, skipping tile — saved {p}")
             self._ztilt_idx += 1
             QTimer.singleShot(100, self._advance_ztilt_survey)
             return
@@ -1130,6 +1141,8 @@ class StageCalibration(QObject):
 
         markers = detect_markers(frame, threshold=self.DETECTION_THRESHOLD)
         if not markers:
+            p = save_failed_frame(frame, "cal_fine_start")
+            print(f"[Cal] Fine start: no markers — saved {p}")
             self._active = False
             self._phase = 'idle'
             self.finished.emit(True, "Coarse done (no markers for fine).", self.result)

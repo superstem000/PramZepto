@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import List, Tuple, Dict, Optional
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from orient_calibration import detect_markers_corrected
+from feature_detection import save_failed_frame
 
 def generate_spiral_path(size=5, offset_col=0, offset_row=0):
     """Generate inward spiral from (0,0) corner to center.
@@ -550,14 +551,16 @@ class SpiralScanController(QObject):
 
             markers = self._detect(frame)
             if not markers:
-                print(f"[DemoScan] Detection failed (no markers)")
+                p = save_failed_frame(frame, "demo_multi_no_markers")
+                print(f"[DemoScan] Detection failed (no markers) — saved {p}")
                 self._on_localize_fail(lambda: self._detect_and_move_multi(
                     dest_col, dest_row, max_tiles, callback))
                 return None
             expected_pos = (self._last_known_col, self._last_known_row) if self._has_known_position else None
             markers = self.calibration._filter_suspicious_markers(markers, expected_pos=expected_pos)
             if not markers:
-                print(f"[DemoScan] Detection failed (all filtered)")
+                p = save_failed_frame(frame, "demo_multi_all_filtered")
+                print(f"[DemoScan] Detection failed (all filtered) — saved {p}")
                 self._on_localize_fail(lambda: self._detect_and_move_multi(
                     dest_col, dest_row, max_tiles, callback))
                 return None
@@ -747,10 +750,14 @@ class SpiralScanController(QObject):
 
         markers = self._detect(frame)
         if not markers:
+            p = save_failed_frame(frame, "demo_fine_no_markers")
+            print(f"[DemoScan] Fine: no markers — saved {p}")
             self._on_localize_fail(lambda: self._fine_correct(callback)); return
         expected_pos = self._current_target
         markers = self.calibration._filter_suspicious_markers(markers, expected_pos=expected_pos)
         if not markers:
+            p = save_failed_frame(frame, "demo_fine_all_filtered")
+            print(f"[DemoScan] Fine: all filtered — saved {p}")
             self._on_localize_fail(lambda: self._fine_correct(callback)); return
 
         cx, cy = cal.image_center_x, cal.image_center_y
