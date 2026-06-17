@@ -90,7 +90,7 @@ class SpiralScanController(QObject):
     SETTLE_MS = 200
     DISCARD_FRAMES = 1
     GRID_SIZE = 31          # full grid size (for detection/calibration)
-    SCAN_SIZE = 10           # 5×5 scan
+    SCAN_SIZE = 31           # 5×5 scan
     SKIP_THRESHOLD_FS = 2.0
     MAX_FINE_ERROR_FS = 5.0
     MAX_RECOVERY_ATTEMPTS = 3
@@ -98,13 +98,14 @@ class SpiralScanController(QObject):
     WALK_JUMP_SIZE = 2
     WALK_ESCALATE_NO_PROGRESS = 4   # full AF after this many stalled walk checks
     WALK_MAX_NO_PROGRESS = 8        # abort walk if still stuck after this many
-    AF_EVERY_N_TILES = 2
+    AF_EVERY_N_TILES = 1
     LEARN_RATE = 0.02
     DZ_PER_COL = -0.220
     DZ_PER_ROW = 0.024
     DZ_PER_TILE = -0.03
     AF_MODE = 'minimal'
     SCAN_SPEED_MULTIPLIER = 0.5
+    DEAD_TILE_RESTARTS = 10   # consecutive localize failures before a tile is skipped
 
     def __init__(self, calibration, af_controller, move_to_ctrl,
                  camera_preview, mc, motors_config, config, parent=None):
@@ -185,6 +186,14 @@ class SpiralScanController(QObject):
         self._scan_bounds_applied = False
         self._single_tile_af_retries = 0
         self._scan_move_cap_active = False
+        # Dead-region skip state
+        self._last_good_tile = None     # (col,row,x,y,z) — single anchor slot
+        self._dead_restarts = 0
+        self._failed_tiles = set()
+        self._post_skip = False         # suppress Z/pitch learning on first tile after a skip
+        self._pending_z_sample = None   # staged at periodic AF, committed only on confirmation
+        self._skip_candidate = None
+        self._in_walk = False           # walk phase has its own bounded give-up
         self._orientation = "normal"  # updated in start()
 
     def is_active(self): return self._active
@@ -301,6 +310,12 @@ class SpiralScanController(QObject):
         self._single_tile_af_retries = 0
         self._cumulative_tiles = 0
         self._z_samples = []  # fresh samples each scan session
+        self._last_good_tile = None
+        self._dead_restarts = 0
+        self._failed_tiles = set()
+        self._post_skip = False
+        self._pending_z_sample = None
+        self._in_walk = False
         if output_dir: self._output_base = output_dir
         os.makedirs(self._output_base, exist_ok=True)
         self._z_log_path = os.path.join(self._output_base, f"z_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
@@ -535,22 +550,16 @@ class SpiralScanController(QObject):
 
             markers = self._detect(frame)
             if not markers:
-                print(f"[DemoScan] Detection failed (no markers) — AF and retry")
-                self._consecutive_af_failures += 1
-                self._state = 'sanity_af'
-                self._after_move_cb = lambda: self._detect_and_move_multi(
-                    dest_col, dest_row, max_tiles, callback)
-                self._start_escalating_af()
+                print(f"[DemoScan] Detection failed (no markers)")
+                self._on_localize_fail(lambda: self._detect_and_move_multi(
+                    dest_col, dest_row, max_tiles, callback))
                 return None
             expected_pos = (self._last_known_col, self._last_known_row) if self._has_known_position else None
             markers = self.calibration._filter_suspicious_markers(markers, expected_pos=expected_pos)
             if not markers:
-                print(f"[DemoScan] Detection failed (all filtered) — AF and retry")
-                self._consecutive_af_failures += 1
-                self._state = 'sanity_af'
-                self._after_move_cb = lambda: self._detect_and_move_multi(
-                    dest_col, dest_row, max_tiles, callback)
-                self._start_escalating_af()
+                print(f"[DemoScan] Detection failed (all filtered)")
+                self._on_localize_fail(lambda: self._detect_and_move_multi(
+                    dest_col, dest_row, max_tiles, callback))
                 return None
 
         cur_col, cur_row, ref_m, exact = self._infer_tile_at_ideal(cal, markers)
@@ -595,6 +604,7 @@ class SpiralScanController(QObject):
         self._last_known_row = cur_row
         self._has_known_position = True
         self._consecutive_af_failures = 0
+        self._dead_restarts = 0
         self._last_good_z = float(getattr(self.MOTORS, "z_current_position_full_step", 0.0))  # ADDED
 
         total_dcol = dest_col - cur_col
@@ -733,15 +743,15 @@ class SpiralScanController(QObject):
         cal = self.calibration.get_result()
         frame = self.camera_preview.capture_to_array(self._camera_settings)
         if frame is None:
-            QTimer.singleShot(10, callback); return
+            QTimer.singleShot(50, lambda: self._fine_correct(callback)); return
 
         markers = self._detect(frame)
         if not markers:
-            QTimer.singleShot(10, callback); return
+            self._on_localize_fail(lambda: self._fine_correct(callback)); return
         expected_pos = self._current_target
         markers = self.calibration._filter_suspicious_markers(markers, expected_pos=expected_pos)
         if not markers:
-            QTimer.singleShot(10, callback); return
+            self._on_localize_fail(lambda: self._fine_correct(callback)); return
 
         cx, cy = cal.image_center_x, cal.image_center_y
         target_col, target_row = self._current_target
@@ -796,7 +806,7 @@ class SpiralScanController(QObject):
         # CRITICAL: learn from the FIRST landing error (recovery_attempts == 0),
         # which reflects the systematic pitch bias. Post-correction residuals
         # are just noise and don't carry the signal we need.
-        if self._recovery_attempts == 0:
+        if self._recovery_attempts == 0 and not self._post_skip:
             stored_ideal_px = np.array([cx, cy]) - 0.5 * cal.grid_pitch_col_px - 0.5 * cal.grid_pitch_row_px
             stored_expected_px = stored_ideal_px - (dcol_landed * cal.grid_pitch_col_px + drow_landed * cal.grid_pitch_row_px)
             stored_miss_px = actual_px - stored_expected_px
@@ -862,22 +872,16 @@ class SpiralScanController(QObject):
                       f"{self.MAX_RECOVERY_ATTEMPTS} attempts "
                       f"(err {error_mag:.1f}fs) — AF and retry")
                 self._recovery_attempts = 0
-                self._consecutive_af_failures += 1
-                self._state = 'sanity_af'
-                self._after_move_cb = lambda: QTimer.singleShot(
-                    self.SETTLE_MS, lambda: self._fine_correct(callback))
-                self._start_escalating_af()
+                self._on_localize_fail(lambda: QTimer.singleShot(
+                    self.SETTLE_MS, lambda: self._fine_correct(callback)))
                 return
 
             # Check move cap before executing correction
             if self._check_move_cap(error_fs[0], error_fs[1]):
                 print(f"[DemoScan] Fine correction blocked by move cap — AF and retry")
                 self._recovery_attempts = 0
-                self._consecutive_af_failures += 1
-                self._state = 'sanity_af'
-                self._after_move_cb = lambda: QTimer.singleShot(
-                    self.SETTLE_MS, lambda: self._fine_correct(callback))
-                self._start_escalating_af()
+                self._on_localize_fail(lambda: QTimer.singleShot(
+                    self.SETTLE_MS, lambda: self._fine_correct(callback)))
                 return
 
             print(f"[DemoScan] Corrective move: error {error_mag:.1f}fs "
@@ -902,12 +906,166 @@ class SpiralScanController(QObject):
         self._last_fine_frame = frame
         # Cache markers for next _detect_and_move_multi to skip redundant detection
         self._cached_markers = markers
+
+        # ── Confirmed-good tile: update single anchor, commit staged Z sample ──
+        self._dead_restarts = 0
+        gx = float(getattr(self.MOTORS, "x_current_position_full_step", 0.0))
+        gy = float(getattr(self.MOTORS, "y_current_position_full_step", 0.0))
+        gz = float(getattr(self.MOTORS, "z_current_position_full_step", 0.0))
+        self._last_good_tile = (target_col, target_row, gx, gy, gz)
+
+        # Commit the Z sample staged at periodic AF — only now that the tile is
+        # confirmed. Drop it entirely on the first tile after a skip so the
+        # post-jump discontinuity never enters the tilt fit.
+        if self._pending_z_sample is not None:
+            if not self._post_skip:
+                s = self._pending_z_sample
+                self._cumulative_tiles += s['dtiles']
+                self._z_samples.append({'col': s['col'], 'row': s['row'],
+                                        'tiles': self._cumulative_tiles, 'z': s['z']})
+                self._fit_z_tilt()
+            self._pending_z_sample = None
+        self._post_skip = False
+
         QTimer.singleShot(10, callback)
 
     def _recovery_af_then_fine(self):
         if self._stop_requested: return
         self._state = 'recovery_af'
         self._start_escalating_af()
+
+    # ═══════════════════════════════════════════════════════════════
+    # Dead-region skip
+    # ═══════════════════════════════════════════════════════════════
+
+    def _on_localize_fail(self, retry_cb):
+        """Single funnel for every failure that escalates AF range. Each call
+        is one range-increasing restart; during spiral acquisition they count
+        toward DEAD_TILE_RESTARTS and trigger a skip once the cap is hit. The
+        walk phase (to the first tile / back to center) is excluded — it has
+        its own bounded give-up (WALK_MAX_NO_PROGRESS) and different anchor
+        semantics — so during a walk this just escalates AF and retries."""
+        if self._stop_requested:
+            return
+        self._pending_z_sample = None  # this tile was never confirmed
+        self._consecutive_af_failures += 1
+        in_spiral_step = self._scan_move_cap_active and not self._in_walk
+        if in_spiral_step:
+            self._dead_restarts += 1
+            if self._dead_restarts >= self.DEAD_TILE_RESTARTS:
+                print(f"[DemoScan] {self._dead_restarts} range-increasing restarts "
+                      f"at target {self._current_target} — declaring dead, skipping")
+                self._skip_dead_tile()
+                return
+        self._state = 'sanity_af'
+        self._after_move_cb = retry_cb
+        self._start_escalating_af()
+
+    def _skip_dead_tile(self):
+        """Give up on the current target. Return to the last confirmed good
+        tile (blind, cap-bypassing), AF there, then open-loop hop to the next
+        spiral tile and re-enter the normal flow. The anchor stays pinned to
+        the last good tile, so consecutive skips (a multi-tile dead region)
+        each hop from the same known origin and errors don't accumulate."""
+        if self._stop_requested:
+            return
+        if self._last_good_tile is None:
+            self.stop("Dead tile with no good anchor to fall back to")
+            return
+
+        self._failed_tiles.add(self._current_target)
+        self._log_scan(self._current_target[0], self._current_target[1], 'skipped')
+        print(f"[DemoScan] Skipping dead tile {self._current_target}")
+
+        # Reset failure counters and any staged learning.
+        self._dead_restarts = 0
+        self._consecutive_af_failures = 0
+        self._recovery_attempts = 0
+        self._pending_z_sample = None
+        self._cached_markers = None
+
+        # Out of tiles? Finish the cycle.
+        if self._spiral_idx >= len(self._spiral_path):
+            print(f"[DemoScan] No tiles left after skip — finishing scan")
+            self._scan_move_cap_active = False
+            self._walk_to_target_then(self._center_col, self._center_row, self._return_af)
+            return
+
+        # Consume the next candidate (mirrors _advance_spiral's read+increment).
+        self._skip_candidate = self._spiral_path[self._spiral_idx]
+        self._spiral_idx += 1
+
+        gcol, grow, gx, gy, gz = self._last_good_tile
+        print(f"[DemoScan] Returning to anchor ({gcol},{grow}) "
+              f"X={gx:.1f} Y={gy:.1f} Z={gz:.3f}, then hopping to {self._skip_candidate}")
+        self.progress.emit('skipping', f'Dead region — skipping to {self._skip_candidate}')
+
+        # Blind absolute move back to the anchor. Direct move_to_ctrl.start
+        # bypasses _check_move_cap entirely; the anchor is in-grid so
+        # motion.limits will not clamp it.
+        self._state = 'moving'
+        self._phase_sub = ''
+        self._tile_target_x, self._tile_target_y, self._tile_target_z = gx, gy, gz
+        self._after_move_cb = self._skip_af_at_anchor
+        self.move_to_ctrl.start(gx, gy, gz)
+
+    def _skip_af_at_anchor(self):
+        if self._stop_requested: return
+        print(f"[DemoScan] Skip: AF at anchor")
+        self._state = 'skip_af'
+        self._after_move_cb = self._skip_hop_to_candidate
+        self.af_controller.start_quick(self._camera_settings)
+
+    def _skip_hop_to_candidate(self):
+        if self._stop_requested: return
+        cal = self.calibration.get_result()
+        gcol, grow, gx, gy, gz = self._last_good_tile
+        cand_col, cand_row = self._skip_candidate
+        dcol = cand_col - gcol
+        drow = cand_row - grow
+        delta_fs = dcol * cal.grid_pitch_col_fs + drow * cal.grid_pitch_row_fs
+        dz = self._dz_per_col * dcol + self._dz_per_row * drow  # tilt-aware; AF refines
+        tx = gx + float(delta_fs[0])
+        ty = gy + float(delta_fs[1])
+        tz = gz + dz
+        print(f"[DemoScan] Skip: open-loop hop ({gcol},{grow})->({cand_col},{cand_row}) "
+              f"d=({dcol},{drow}) -> X={tx:.1f} Y={ty:.1f} Z={tz:.3f}")
+        # Direct move — cap bypassed; in-grid target stays within motion.limits.
+        self._state = 'moving'
+        self._phase_sub = ''
+        self._tile_target_x, self._tile_target_y, self._tile_target_z = tx, ty, tz
+        self._after_move_cb = self._skip_af_at_candidate
+        self.move_to_ctrl.start(tx, ty, tz)
+
+    def _skip_af_at_candidate(self):
+        if self._stop_requested: return
+        print(f"[DemoScan] Skip: AF at candidate {self._skip_candidate}")
+        self._state = 'skip_af'
+        self._after_move_cb = self._skip_reenter
+        self.af_controller.start_quick(self._camera_settings)
+
+    def _skip_reenter(self):
+        if self._stop_requested: return
+        cand_col, cand_row = self._skip_candidate
+        # Pin every continuity reference to the candidate so the jump is
+        # invisible to Z prediction, the every-2-tile Z correction, pitch
+        # learning, and the sanity-jump check.
+        self._current_target = (cand_col, cand_row)
+        self._last_known_col, self._last_known_row = cand_col, cand_row
+        self._has_known_position = True
+        self._learn_anchor_col, self._learn_anchor_row = cand_col, cand_row
+        self._last_z_correct_pos = (cand_col, cand_row)
+        self._last_af_col, self._last_af_row = cand_col, cand_row
+        self._last_af_z = float(getattr(self.MOTORS, "z_current_position_full_step", 0.0))
+        self._last_good_z = self._last_af_z
+        self._tiles_since_af = 0
+        self._post_skip = True   # suppress Z/pitch learning for this first tile
+        self._pending_z_sample = None
+        self._recovery_attempts = 0
+        self._cached_markers = None
+        self._in_walk = False
+        print(f"[DemoScan] Skip: re-entering normal flow at {self._skip_candidate}")
+        self._detect_and_move_one_step(cand_col, cand_row, self._on_spiral_arrived)
 
     # ═══════════════════════════════════════════════════════════════
     # Signal handlers
@@ -966,6 +1124,15 @@ class SpiralScanController(QObject):
 
         # Walk AF
         if self._state == 'walk_af':
+            self._state = 'idle'
+            cb = self._after_move_cb
+            self._after_move_cb = None
+            if cb: QTimer.singleShot(10, cb)
+            return
+
+        # Skip-chain AF (return-to-anchor AF and post-hop AF) — generic
+        # AF-then-callback; never touches Z learning or tile counters.
+        if self._state == 'skip_af':
             self._state = 'idle'
             cb = self._after_move_cb
             self._after_move_cb = None
@@ -1034,18 +1201,14 @@ class SpiralScanController(QObject):
             self._state = 'idle'
 
             col, row = self._current_target
-            self._cumulative_tiles += self._tiles_since_af
 
-            # Collect Z sample for tilt learning
-            self._z_samples.append({
-                'col': col,
-                'row': row,
-                'tiles': self._cumulative_tiles,
-                'z': cur_z,
-            })
-
-            # Try to fit Z tilt model
-            self._fit_z_tilt()
+            # Stage the Z sample — do NOT commit/fit yet. It is added to the
+            # tilt model only once _fine_correct confirms this tile is real, so
+            # a dead tile (AF locked on a scratch) never pollutes the fit.
+            self._pending_z_sample = {
+                'col': col, 'row': row, 'z': cur_z,
+                'dtiles': self._tiles_since_af,
+            }
 
             # Log prediction error for diagnostics
             predicted_dz = (self._dz_per_col * (col - self._last_af_col) +
@@ -1053,8 +1216,7 @@ class SpiralScanController(QObject):
                            self._dz_per_tile * self._tiles_since_af)
             actual_dz = cur_z - self._last_af_z
             error = actual_dz - predicted_dz
-            print(f"[DemoScan] Z-sample #{len(self._z_samples)}: "
-                  f"({col},{row}) tile#{self._cumulative_tiles} "
+            print(f"[DemoScan] Z-sample staged: ({col},{row}) "
                   f"Z={cur_z:.3f} pred_err={error:.3f}")
 
             # Log AF to scan log
@@ -1077,6 +1239,7 @@ class SpiralScanController(QObject):
 
     def _walk_to_target_then(self, target_col, target_row, callback):
         if self._stop_requested: return
+        self._in_walk = True
         self._walk_target_col = target_col
         self._walk_target_row = target_row
         self._walk_final_cb = callback
@@ -1105,6 +1268,7 @@ class SpiralScanController(QObject):
                 self._last_known_row = self._walk_target_row
                 self._last_z_correct_pos = (self._walk_target_col, self._walk_target_row)
                 self._walk_no_progress = 0
+                self._in_walk = False
                 QTimer.singleShot(10, self._walk_final_cb)
                 return
             # Stall safety net: inferred position not advancing toward target.
@@ -1146,6 +1310,14 @@ class SpiralScanController(QObject):
         self._tiles_since_af = 0
         self._tile_step_count = 0
         self._last_z_correct_pos = (self._center_col, self._center_row)
+        # Seed the anchor with the center (reached via walk + AF + fine-correct)
+        cx_ = float(getattr(self.MOTORS, "x_current_position_full_step", 0.0))
+        cy_ = float(getattr(self.MOTORS, "y_current_position_full_step", 0.0))
+        cz_ = float(getattr(self.MOTORS, "z_current_position_full_step", 0.0))
+        self._last_good_tile = (self._center_col, self._center_row, cx_, cy_, cz_)
+        self._dead_restarts = 0
+        self._post_skip = False
+        self._pending_z_sample = None
         self._scan_move_cap_active = True
         print(f"[DemoScan] === 5×5 scan cycle #{self._cycle_count} "
               f"center=({self._center_col},{self._center_row}) "
@@ -1209,6 +1381,7 @@ class SpiralScanController(QObject):
     
     def _on_spiral_arrived(self):
         if self._stop_requested: return
+        self._in_walk = False
         self._tiles_since_af += 1
         self._tile_step_count += 1
         self._single_tile_af_retries = 0  # move succeeded, reset retry counter

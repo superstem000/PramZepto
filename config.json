@@ -53,9 +53,9 @@
     "y_full_step_max": 5200,
     "z_full_step_min": 0,
     "z_full_step_max": 1200,
-    "x_current_position_full_step": 4290.375,
-    "y_current_position_full_step": 508.3125,
-    "z_current_position_full_step": 174.25
+    "x_current_position_full_step": 4258.65625,
+    "y_current_position_full_step": 487.75,
+    "z_current_position_full_step": 156.40625
   },
   "endstops": {
     "chip": 0,
@@ -109,15 +109,15 @@
   "camera": {
     "default_width": 4056,
     "default_height": 3040,
-    "default_shutter": "600",
-    "default_contrast": "3",
+    "default_shutter": "250",
+    "default_contrast": "4",
     "default_gain": "1",
     "default_awbgains": "1,0.01",
-    "default_sharpness": "3",
+    "default_sharpness": "10",
     "default_brightness": "",
     "default_quality": 100,
     "default_folder": "~/Desktop/Users/",
-    "default_ev": "",
+    "default_ev": "5",
     "default_prev_time": "",
     "default_denoise": "off",
     "default_digital_gain": "",
