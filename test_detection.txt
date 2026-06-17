@@ -1,0 +1,7 @@
+Image: test.jpg (4056x3040)
+Threshold: 50
+Components: 15
+Clusters: 1
+Markers: 1
+
+(14,20) px=(1935,1961) conf=1.630
