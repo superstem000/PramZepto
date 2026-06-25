@@ -145,7 +145,8 @@ class SpiralScanController(QObject):
         self._spiral_idx = 0
         self._camera_settings = {}
         self._cached_markers = None  # reuse detection from fine_correct
-        self._output_base = os.path.expanduser("~/Desktop/Users/full_scan")
+        self._output_parent = os.path.expanduser("~/Desktop/Users/scans")
+        self._output_base = None  # set per-session in start()
         self._z_log_path = ""
         # Z correction state — load from calibration if available
         self._tile_step_count = 0
@@ -255,14 +256,17 @@ class SpiralScanController(QObject):
         self._single_tile_af_retries = 0
         self._cumulative_tiles = 0
         self._z_samples = []  # fresh samples each scan session
-        if output_dir: self._output_base = output_dir
+        if output_dir: self._output_parent = output_dir
+        session_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._output_base = os.path.join(self._output_parent, f"full_{session_ts}")
         os.makedirs(self._output_base, exist_ok=True)
-        self._z_log_path = os.path.join(self._output_base, f"z_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        print(f"[FullScan] Session output: {self._output_base}")
+        self._z_log_path = os.path.join(self._output_base, "z_log.csv")
         with open(self._z_log_path, 'w') as f:
             f.write("timestamp,col,row,z_fs,state\n")
 
         # Comprehensive scan log for visualization/analysis
-        self._scan_log_path = os.path.join(self._output_base, f"scan_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        self._scan_log_path = os.path.join(self._output_base, "scan_log.csv")
         with open(self._scan_log_path, 'w') as f:
             f.write("timestamp,cycle,tile_idx,col,row,x_fs,y_fs,z_fs,"
                     "error_fs_x,error_fs_y,error_mag,"
@@ -1341,8 +1345,8 @@ class SpiralScanController(QObject):
 
         cal = self.calibration.get_result()
         # Half a feature distance as margin
-        col_mag = float(np.linalg.norm(cal.grid_pitch_col_fs)) * 0.5
-        row_mag = float(np.linalg.norm(cal.grid_pitch_row_fs)) * 0.5
+        col_mag = float(np.linalg.norm(cal.grid_pitch_col_fs)) * 0.8
+        row_mag = float(np.linalg.norm(cal.grid_pitch_row_fs)) * 0.8
         margin = max(col_mag, row_mag)
 
         xs = [pos[0] for pos in self._corner_positions.values()]
@@ -1416,7 +1420,7 @@ class SpiralScanController(QObject):
         try:
             from PIL import Image
             
-            cycle_dir = os.path.join(self._output_base, f"full_{self._cycle_count:04d}")
+            cycle_dir = os.path.join(self._output_base, f"cycle_{self._cycle_count:04d}")
             if not os.path.isdir(cycle_dir):
                 print(f"[FullScan] Stitch: no cycle dir {cycle_dir}")
                 return
@@ -1606,9 +1610,9 @@ class SpiralScanController(QObject):
             if frame is None: return
             self._last_fine_frame = None
 
-            d = os.path.join(self._output_base, f"full_{self._cycle_count:04d}")
+            d = os.path.join(self._output_base, f"cycle_{self._cycle_count:04d}")
             os.makedirs(d, exist_ok=True)
-            fn = f"tile_{col:02d}_{row:02d}_{datetime.now().strftime('%H.%M.%S')}.jpg"
+            fn = f"tile_{col:02d}_{row:02d}_{datetime.now().strftime('%H%M%S_%f')[:-3]}.jpg"
             p = os.path.join(d, fn)
             from PIL import Image
             Image.fromarray(frame).save(p, quality=self._camera_settings.get('quality', 95))
