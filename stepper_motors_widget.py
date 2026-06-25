@@ -270,7 +270,7 @@ class StepperMotorsWidget(QWidget):
         LABEL_W   = 140   # px — fits "Scan interval:" at 14pt font + cushion
         INPUT_H   = 55    # px — matches global stylesheet's min-height + padding
         ROW_H     = 60    # px — INPUT_H + 5px vertical breathing room
-        ROW_SPACE = 8     # px — gap between rows
+        ROW_SPACE = 18    # px — matches the right-column button spacing
         VC = Qt.AlignmentFlag.AlignVCenter
 
         scan_settings = QWidget()
