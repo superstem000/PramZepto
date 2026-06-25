@@ -260,10 +260,17 @@ class StepperMotorsWidget(QWidget):
         # or form-layout magic — the previous attempts kept producing rows
         # where labels and combos rendered at different y because the combo's
         # natural height was larger than expected.
-        LABEL_W   = 130   # px — wide enough for "Scan interval:" + padding
-        INPUT_H   = 30    # px — uniform height for every label and input
-        ROW_H     = 34    # px — fixed row height = INPUT_H + 4 vertical padding
-        ROW_SPACE = 6     # px — gap between rows
+        # NOTE: app_main_window applies a global stylesheet that sets
+        #   QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { min-height: 45px;
+        #     padding: 5px; border: 2px solid; }
+        # So combos/spinboxes actually render ~55px tall (45 min + 2*5 padding
+        # + 2*2 border). Forcing setFixedHeight(30) made them clip — the text
+        # was drawn for a 55px widget but the geometry was clamped to 30px.
+        # Sizes below are tuned to match the global style.
+        LABEL_W   = 140   # px — fits "Scan interval:" at 14pt font + cushion
+        INPUT_H   = 55    # px — matches global stylesheet's min-height + padding
+        ROW_H     = 60    # px — INPUT_H + 5px vertical breathing room
+        ROW_SPACE = 8     # px — gap between rows
         VC = Qt.AlignmentFlag.AlignVCenter
 
         scan_settings = QWidget()
