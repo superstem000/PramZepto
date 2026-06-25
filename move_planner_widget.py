@@ -318,22 +318,26 @@ class MovePlannerWidget(QWidget):
         self.btn_add_spiral.clicked.connect(self._on_add_spiral_scan)
         spiral_block.addWidget(self.btn_add_spiral)
 
-        spiral_inputs = QHBoxLayout()
-        spiral_inputs.setSpacing(6)
-        spiral_inputs.addWidget(QLabel("Size:"))
+        spiral_inputs = QWidget()
+        spiral_inputs.setFixedHeight(34)
+        sh = QHBoxLayout(spiral_inputs)
+        sh.setContentsMargins(0, 0, 0, 0)
+        sh.setSpacing(6)
+        sh.addWidget(QLabel("Size:"))
         self.spiral_step_size_combo = QComboBox()
         self.spiral_step_size_combo.addItems(["3", "5", "7", "9", "11", "15", "21", "31"])
         self.spiral_step_size_combo.setCurrentText("5")
-        self.spiral_step_size_combo.setFixedWidth(60)
-        spiral_inputs.addWidget(self.spiral_step_size_combo)
-        spiral_inputs.addWidget(QLabel("Cycles:"))
+        self.spiral_step_size_combo.setFixedWidth(80)
+        sh.addWidget(self.spiral_step_size_combo)
+        sh.addWidget(QLabel("Cycles:"))
         self.spiral_step_cycles_spin = QSpinBox()
-        self.spiral_step_cycles_spin.setRange(1, 999)  # 1..N — no ∞ for a sequence step
+        self.spiral_step_cycles_spin.setRange(0, 999)  # 0 = ∞ (runs until manually stopped)
         self.spiral_step_cycles_spin.setValue(1)
-        self.spiral_step_cycles_spin.setFixedWidth(70)
-        spiral_inputs.addWidget(self.spiral_step_cycles_spin)
-        spiral_inputs.addStretch()
-        spiral_block.addLayout(spiral_inputs)
+        self.spiral_step_cycles_spin.setFixedWidth(75)
+        self.spiral_step_cycles_spin.setSpecialValueText("∞")
+        sh.addWidget(self.spiral_step_cycles_spin)
+        sh.addStretch()
+        spiral_block.addWidget(spiral_inputs)
 
         type_layout.addLayout(spiral_block)
 
@@ -544,6 +548,8 @@ class MovePlannerWidget(QWidget):
         # Read scan size + cycle count from this widget's own inputs, so each
         # spiral_scan step in a sequence carries its own settings independent
         # of whatever the manual-mode stepper widget currently shows.
+        # cycles = 0 → ∞ (runs until manually stopped; recipe will not advance
+        # past this step on its own).
         try:
             size = int(self.spiral_step_size_combo.currentText())
         except Exception:
@@ -552,17 +558,17 @@ class MovePlannerWidget(QWidget):
             cyc = int(self.spiral_step_cycles_spin.value())
         except Exception:
             cyc = 1
-        if cyc < 1: cyc = 1
+        if cyc < 0: cyc = 0
+        cyc_text = "∞" if cyc == 0 else f"{cyc} cycle{'s' if cyc != 1 else ''}"
         step = RecipeStep(
             step_type="spiral_scan",
             dwell_ms=self.dwell_ms.value(),
             num_cycles=cyc,
             scan_size=size,
-            note=f"Spiral scan ({size}×{size}, {cyc} cycle{'s' if cyc != 1 else ''})",
+            note=f"Spiral scan ({size}×{size}, {cyc_text})",
         )
         self._add_step_to_table(step)
-        self._set_status(f"Added spiral scan step ({size}×{size}, {cyc} cycle"
-                         f"{'s' if cyc != 1 else ''}).")
+        self._set_status(f"Added spiral scan step ({size}×{size}, {cyc_text}).")
 
     def _add_step_to_table(self, step: RecipeStep):
         r = self.table.rowCount()
@@ -1058,8 +1064,8 @@ class MovePlannerWidget(QWidget):
 
         # Resolve scan settings (interval, center_col, center_row)
         interval_min = 5
-        center_col = 13
-        center_row = 13
+        center_col = 15
+        center_row = 15
         try:
             if callable(self._spiral_scan_settings_provider):
                 vals = self._spiral_scan_settings_provider() or {}

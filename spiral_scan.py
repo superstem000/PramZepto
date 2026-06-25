@@ -180,8 +180,8 @@ class SpiralScanController(QObject):
         self._last_fine_frame = None
         self._cycle_start_time = None
         self._scan_interval_min = 5        # default 5 minutes
-        self._center_col = 13              # default center for 5x5 in 31x31 grid
-        self._center_row = 13
+        self._center_col = 15              # center of the 31x31 grid (indices 0..30)
+        self._center_row = 15
         self._scan_size = self.SCAN_SIZE   # configurable per-session (odd, >=3)
         self._target_cycles = 0            # 0 = unlimited; >0 = stop after N cycles
         # Corner bounds: record XY at each corner to clamp motion limits

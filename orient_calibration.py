@@ -1011,8 +1011,9 @@ class OrientCalibrationController(QObject):
         # Override settings for calibration: AF every tile, wider search
         self._z_scan.AF_EVERY_N_TILES = 1
         self._z_scan.SCAN_SIZE = 10
-        self._z_scan._center_col = 13
-        self._z_scan._center_row = 13
+        self._z_scan._scan_size = 10
+        self._z_scan._center_col = 15
+        self._z_scan._center_row = 15
         self._z_scan.LEARN_RATE = 0.08
         self._z_scan.BASE_AF_RANGE = 0.6
 
@@ -1157,8 +1158,9 @@ class OrientCalibrationController(QObject):
 
         # Normal scan settings — match what the real scan will use
         self._z_scan.SCAN_SIZE = 10
-        self._z_scan._center_col = 13
-        self._z_scan._center_row = 13
+        self._z_scan._scan_size = 10
+        self._z_scan._center_col = 15
+        self._z_scan._center_row = 15
         # AF_EVERY_N_TILES = 2 (default)
         # LEARN_RATE = 0.02 (default)
         # BASE_AF_RANGE = 0.4 (default)
