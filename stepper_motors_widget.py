@@ -254,49 +254,63 @@ class StepperMotorsWidget(QWidget):
         parent_layout.addWidget(row)
 
         # ── Scan Settings (below joysticks) ──
-        # QFormLayout is Qt's purpose-built two-column form widget. It
-        # auto-sizes the label column to the widest label, baseline-aligns
-        # each label with its input row, and applies uniform vertical
-        # spacing between rows — guaranteeing labels never visually drift
-        # against tall combos/spinboxes.
+        # Pixel-precise layout: every label/combo/spinbox forced to the same
+        # height (INPUT_H), every row wrapped in a fixed-height container,
+        # every widget added with AlignVCenter. No reliance on Qt auto-size
+        # or form-layout magic — the previous attempts kept producing rows
+        # where labels and combos rendered at different y because the combo's
+        # natural height was larger than expected.
+        LABEL_W   = 130   # px — wide enough for "Scan interval:" + padding
+        INPUT_H   = 30    # px — uniform height for every label and input
+        ROW_H     = 34    # px — fixed row height = INPUT_H + 4 vertical padding
+        ROW_SPACE = 6     # px — gap between rows
+        VC = Qt.AlignmentFlag.AlignVCenter
+
         scan_settings = QWidget()
         scan_outer = QVBoxLayout(scan_settings)
         scan_outer.setContentsMargins(0, 5, 0, 0)
-        scan_outer.setSpacing(6)
+        scan_outer.setSpacing(ROW_SPACE)
 
         scan_label = QLabel("Scan Settings")
         scan_label.setStyleSheet("font-weight: bold;")
         scan_outer.addWidget(scan_label)
 
-        scan_form = QFormLayout()
-        scan_form.setContentsMargins(0, 0, 0, 0)
-        scan_form.setHorizontalSpacing(10)
-        scan_form.setVerticalSpacing(8)
-        scan_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        scan_form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        scan_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
-        scan_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+        def _label(text, fixed_width=None):
+            lab = QLabel(text)
+            lab.setFixedHeight(INPUT_H)
+            lab.setAlignment(Qt.AlignmentFlag.AlignLeft | VC)
+            if fixed_width is not None:
+                lab.setFixedWidth(fixed_width)
+            return lab
 
-        def _input_row(*widgets):
-            """Pack widgets into a single QWidget for QFormLayout's field column."""
-            w = QWidget()
-            h = QHBoxLayout(w)
+        def _row(label_text, *widgets):
+            row = QWidget()
+            row.setFixedHeight(ROW_H)
+            row.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            h = QHBoxLayout(row)
             h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(6)
-            for wi in widgets:
-                h.addWidget(wi) if hasattr(wi, "sizeHint") else h.addLayout(wi)
+            h.setSpacing(8)
+            h.addWidget(_label(label_text, LABEL_W), 0, VC)
+            for w in widgets:
+                # Force every input/suffix to the same height so the row
+                # has a single consistent baseline.
+                try:
+                    w.setFixedHeight(INPUT_H)
+                except Exception:
+                    pass
+                h.addWidget(w, 0, VC)
             h.addStretch()
-            return w
+            return row
 
-        # Scan interval
+        # Row 1: Scan interval
         self.scan_interval_combo = QComboBox()
         self.scan_interval_combo.addItems([str(m) for m in range(5, 35, 5)])
         self.scan_interval_combo.setCurrentText("5")
         self.scan_interval_combo.setFixedWidth(70)
-        scan_form.addRow("Scan interval:",
-                         _input_row(self.scan_interval_combo, QLabel("min")))
+        scan_outer.addWidget(_row(
+            "Scan interval:", self.scan_interval_combo, QLabel("min")))
 
-        # Scan center (col + row spinboxes)
+        # Row 2: Scan center (col + row spinboxes)
         self.scan_center_col_spin = QSpinBox()
         self.scan_center_col_spin.setRange(2, 28)
         self.scan_center_col_spin.setValue(15)
@@ -307,18 +321,18 @@ class StepperMotorsWidget(QWidget):
         self.scan_center_row_spin.setValue(15)
         self.scan_center_row_spin.setPrefix("row ")
         self.scan_center_row_spin.setFixedWidth(95)
-        scan_form.addRow("Scan center:",
-                         _input_row(self.scan_center_col_spin, self.scan_center_row_spin))
+        scan_outer.addWidget(_row(
+            "Scan center:", self.scan_center_col_spin, self.scan_center_row_spin))
 
-        # Scan size
+        # Row 3: Scan size
         self.scan_size_combo = QComboBox()
         self.scan_size_combo.addItems(["3", "5", "7", "9", "11", "15", "21", "31"])
         self.scan_size_combo.setCurrentText("5")
         self.scan_size_combo.setFixedWidth(70)
-        scan_form.addRow("Scan size:",
-                         _input_row(self.scan_size_combo, QLabel("× size")))
+        scan_outer.addWidget(_row(
+            "Scan size:", self.scan_size_combo, QLabel("× size")))
 
-        # Cycle count
+        # Row 4: Cycle count
         self.scan_cycles_spin = QSpinBox()
         self.scan_cycles_spin.setRange(0, 999)
         self.scan_cycles_spin.setValue(0)
@@ -326,9 +340,7 @@ class StepperMotorsWidget(QWidget):
         self.scan_cycles_spin.setSpecialValueText("∞")
         hint = QLabel("(0 = until stopped)")
         hint.setStyleSheet("color: gray; font-size: 10pt;")
-        scan_form.addRow("Cycles:", _input_row(self.scan_cycles_spin, hint))
-
-        scan_outer.addLayout(scan_form)
+        scan_outer.addWidget(_row("Cycles:", self.scan_cycles_spin, hint))
 
         parent_layout.addWidget(scan_settings)
 
