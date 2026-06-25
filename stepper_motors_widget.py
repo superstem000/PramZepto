@@ -255,29 +255,34 @@ class StepperMotorsWidget(QWidget):
 
         # ── Scan Settings (below joysticks) ──
         scan_settings = QWidget()
-        scan_layout = QVBoxLayout(scan_settings)
-        scan_layout.setContentsMargins(0, 5, 0, 0)
-        scan_layout.setSpacing(8)
+        scan_outer = QVBoxLayout(scan_settings)
+        scan_outer.setContentsMargins(0, 5, 0, 0)
+        scan_outer.setSpacing(6)
 
         scan_label = QLabel("Scan Settings")
         scan_label.setStyleSheet("font-weight: bold;")
-        scan_layout.addWidget(scan_label)
+        scan_outer.addWidget(scan_label)
 
-        # Scan interval
-        interval_row = QHBoxLayout()
-        interval_row.addWidget(QLabel("Scan interval:"))
+        # Grid keeps labels and inputs in clean columns regardless of widget height.
+        scan_grid = QGridLayout()
+        scan_grid.setContentsMargins(0, 0, 0, 0)
+        scan_grid.setHorizontalSpacing(8)
+        scan_grid.setVerticalSpacing(6)
+
+        # row 0: Scan interval
+        scan_grid.addWidget(QLabel("Scan interval:"), 0, 0)
         self.scan_interval_combo = QComboBox()
         self.scan_interval_combo.addItems([str(m) for m in range(5, 35, 5)])  # 5,10,15,20,25,30
         self.scan_interval_combo.setCurrentText("5")
         self.scan_interval_combo.setFixedWidth(70)
-        interval_row.addWidget(self.scan_interval_combo)
-        interval_row.addWidget(QLabel("min"))
-        interval_row.addStretch()
-        scan_layout.addLayout(interval_row)
+        scan_grid.addWidget(self.scan_interval_combo, 0, 1)
+        scan_grid.addWidget(QLabel("min"), 0, 2)
 
-        # Center tile position
-        center_row_layout = QHBoxLayout()
-        center_row_layout.addWidget(QLabel("Scan center:"))
+        # row 1: Scan center (col + row spinboxes share the input column)
+        scan_grid.addWidget(QLabel("Scan center:"), 1, 0)
+        center_box = QHBoxLayout()
+        center_box.setContentsMargins(0, 0, 0, 0)
+        center_box.setSpacing(6)
         self.scan_center_col_spin = QSpinBox()
         self.scan_center_col_spin.setRange(2, 28)
         self.scan_center_col_spin.setValue(13)
@@ -288,35 +293,35 @@ class StepperMotorsWidget(QWidget):
         self.scan_center_row_spin.setValue(13)
         self.scan_center_row_spin.setPrefix("row ")
         self.scan_center_row_spin.setFixedWidth(80)
-        center_row_layout.addWidget(self.scan_center_col_spin)
-        center_row_layout.addWidget(self.scan_center_row_spin)
-        center_row_layout.addStretch()
-        scan_layout.addLayout(center_row_layout)
+        center_box.addWidget(self.scan_center_col_spin)
+        center_box.addWidget(self.scan_center_row_spin)
+        center_wrap = QWidget()
+        center_wrap.setLayout(center_box)
+        scan_grid.addWidget(center_wrap, 1, 1, 1, 2)
 
-        # Scan size (odd, 3..31)
-        size_row = QHBoxLayout()
-        size_row.addWidget(QLabel("Scan size:"))
+        # row 2: Scan size
+        scan_grid.addWidget(QLabel("Scan size:"), 2, 0)
         self.scan_size_combo = QComboBox()
         self.scan_size_combo.addItems(["3", "5", "7", "9", "11", "15", "21", "31"])
         self.scan_size_combo.setCurrentText("5")
         self.scan_size_combo.setFixedWidth(70)
-        size_row.addWidget(self.scan_size_combo)
-        size_row.addWidget(QLabel("× size"))
-        size_row.addStretch()
-        scan_layout.addLayout(size_row)
+        scan_grid.addWidget(self.scan_size_combo, 2, 1)
+        scan_grid.addWidget(QLabel("× size"), 2, 2)
 
-        # Cycle count (0 = run until stopped)
-        cycles_row = QHBoxLayout()
-        cycles_row.addWidget(QLabel("Cycles:"))
+        # row 3: Cycle count (0 = run until stopped)
+        scan_grid.addWidget(QLabel("Cycles:"), 3, 0)
         self.scan_cycles_spin = QSpinBox()
         self.scan_cycles_spin.setRange(0, 999)
         self.scan_cycles_spin.setValue(0)
         self.scan_cycles_spin.setFixedWidth(80)
         self.scan_cycles_spin.setSpecialValueText("∞")
-        cycles_row.addWidget(self.scan_cycles_spin)
-        cycles_row.addWidget(QLabel("(0 = until stopped)"))
-        cycles_row.addStretch()
-        scan_layout.addLayout(cycles_row)
+        scan_grid.addWidget(self.scan_cycles_spin, 3, 1)
+        cycles_hint = QLabel("(0 = until stopped)")
+        cycles_hint.setStyleSheet("color: gray; font-size: 10pt;")
+        scan_grid.addWidget(cycles_hint, 3, 2)
+
+        scan_grid.setColumnStretch(3, 1)  # push everything left
+        scan_outer.addLayout(scan_grid)
 
         parent_layout.addWidget(scan_settings)
 

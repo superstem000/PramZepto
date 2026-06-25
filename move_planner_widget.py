@@ -307,11 +307,35 @@ class MovePlannerWidget(QWidget):
         self.btn_add_microfluidics.clicked.connect(self._on_add_microfluidics)
         type_layout.addWidget(self.btn_add_microfluidics)
 
+        # Spiral scan add: button + size/cycles inputs that the step will use.
+        # Inline so the user doesn't have to go change the manual-mode scan
+        # settings on the stepper widget every time.
+        spiral_block = QVBoxLayout()
+        spiral_block.setSpacing(4)
         self.btn_add_spiral = QPushButton("Spiral Scan")
-        self.btn_add_spiral.setMinimumHeight(150)
+        self.btn_add_spiral.setMinimumHeight(110)
         self.btn_add_spiral.setStyleSheet("background-color: #1565C0; color: white; font-weight: bold;")
         self.btn_add_spiral.clicked.connect(self._on_add_spiral_scan)
-        type_layout.addWidget(self.btn_add_spiral)
+        spiral_block.addWidget(self.btn_add_spiral)
+
+        spiral_inputs = QHBoxLayout()
+        spiral_inputs.setSpacing(6)
+        spiral_inputs.addWidget(QLabel("Size:"))
+        self.spiral_step_size_combo = QComboBox()
+        self.spiral_step_size_combo.addItems(["3", "5", "7", "9", "11", "15", "21", "31"])
+        self.spiral_step_size_combo.setCurrentText("5")
+        self.spiral_step_size_combo.setFixedWidth(60)
+        spiral_inputs.addWidget(self.spiral_step_size_combo)
+        spiral_inputs.addWidget(QLabel("Cycles:"))
+        self.spiral_step_cycles_spin = QSpinBox()
+        self.spiral_step_cycles_spin.setRange(1, 999)  # 1..N — no ∞ for a sequence step
+        self.spiral_step_cycles_spin.setValue(1)
+        self.spiral_step_cycles_spin.setFixedWidth(70)
+        spiral_inputs.addWidget(self.spiral_step_cycles_spin)
+        spiral_inputs.addStretch()
+        spiral_block.addLayout(spiral_inputs)
+
+        type_layout.addLayout(spiral_block)
 
         left_layout.addLayout(type_layout)
 
@@ -517,27 +541,28 @@ class MovePlannerWidget(QWidget):
         self._set_status("Added microfluidics step.")
 
     def _on_add_spiral_scan(self):
-        # Pull current scan_size + cycles from stepper widget as defaults;
-        # default cycles to 1 if the stepper has 0 (unlimited) so a sequence
-        # step terminates.
-        size_default = 5
-        cyc_default = 1
+        # Read scan size + cycle count from this widget's own inputs, so each
+        # spiral_scan step in a sequence carries its own settings independent
+        # of whatever the manual-mode stepper widget currently shows.
         try:
-            s = self.stepper.get_spiral_scan_settings()
-            size_default = int(s.get('scan_size', 5))
-            cyc_default = int(s.get('num_cycles', 0)) or 1
+            size = int(self.spiral_step_size_combo.currentText())
         except Exception:
-            pass
+            size = 5
+        try:
+            cyc = int(self.spiral_step_cycles_spin.value())
+        except Exception:
+            cyc = 1
+        if cyc < 1: cyc = 1
         step = RecipeStep(
             step_type="spiral_scan",
             dwell_ms=self.dwell_ms.value(),
-            num_cycles=cyc_default,
-            scan_size=size_default,
-            note=f"Spiral scan ({size_default}×{size_default}, {cyc_default} cycle"
-                 f"{'s' if cyc_default != 1 else ''})",
+            num_cycles=cyc,
+            scan_size=size,
+            note=f"Spiral scan ({size}×{size}, {cyc} cycle{'s' if cyc != 1 else ''})",
         )
         self._add_step_to_table(step)
-        self._set_status("Added spiral scan step.")
+        self._set_status(f"Added spiral scan step ({size}×{size}, {cyc} cycle"
+                         f"{'s' if cyc != 1 else ''}).")
 
     def _add_step_to_table(self, step: RecipeStep):
         r = self.table.rowCount()
