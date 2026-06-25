@@ -182,6 +182,8 @@ class SpiralScanController(QObject):
         self._scan_interval_min = 5        # default 5 minutes
         self._center_col = 13              # default center for 5x5 in 31x31 grid
         self._center_row = 13
+        self._scan_size = self.SCAN_SIZE   # configurable per-session (odd, >=3)
+        self._target_cycles = 0            # 0 = unlimited; >0 = stop after N cycles
         # Corner bounds: record XY at each corner to clamp motion limits
         self._corner_positions = {}
         self._corners_set = set()
@@ -272,16 +274,31 @@ class SpiralScanController(QObject):
             return True
         return False
 
-    def configure(self, interval_min=None, center_col=None, center_row=None):
-        """Configure scan interval and center position."""
+    def configure(self, interval_min=None, center_col=None, center_row=None,
+                  scan_size=None, num_cycles=None):
+        """Configure scan interval, center, size, and target cycle count.
+
+        scan_size: odd int >=3 (e.g. 3, 5, 7). Clamped so the scan fits within
+                   the GRID_SIZE (centered on center_col/center_row).
+        num_cycles: 0 = unlimited (default); >0 = stop after N cycles.
+        """
         if interval_min is not None:
             self._scan_interval_min = max(1, min(30, interval_min))
+        if scan_size is not None:
+            s = int(scan_size)
+            if s < 3: s = 3
+            if s > self.GRID_SIZE: s = self.GRID_SIZE
+            if s % 2 == 0: s += 1  # force odd
+            self._scan_size = s
         if center_col is not None and center_row is not None:
-            # Ensure 5x5 fits: center must be in [2..28] for a 31x31 grid
-            center_col = max(2, min(28, center_col))
-            center_row = max(2, min(28, center_row))
+            half = self._scan_size // 2
+            lo, hi = half, self.GRID_SIZE - 1 - half
+            center_col = max(lo, min(hi, center_col))
+            center_row = max(lo, min(hi, center_row))
             self._center_col = center_col
             self._center_row = center_row
+        if num_cycles is not None:
+            self._target_cycles = max(0, int(num_cycles))
 
     def start(self, camera_settings, output_dir=""):
         if self._active: return
@@ -1314,10 +1331,10 @@ class SpiralScanController(QObject):
         if self._stop_requested or not self._active:
             return
         # 5×5 grid centered on _center_col/_center_row
-        offset_col = self._center_col - self.SCAN_SIZE // 2
-        offset_row = self._center_row - self.SCAN_SIZE // 2
+        offset_col = self._center_col - self._scan_size // 2
+        offset_row = self._center_row - self._scan_size // 2
         self._spiral_path = generate_spiral_path(
-            self.SCAN_SIZE, offset_col, offset_row)
+            self._scan_size, offset_col, offset_row)
         self._spiral_idx = 0
         self._cycle_count += 1
         self._tiles_since_af = 0
@@ -1384,6 +1401,11 @@ class SpiralScanController(QObject):
 
     def _wait_for_next_cycle(self):
         if self._stop_requested: return
+        # Target-cycles cap: stop instead of scheduling next cycle.
+        if self._target_cycles > 0 and self._cycle_count >= self._target_cycles:
+            print(f"[DemoScan] Target {self._target_cycles} cycle(s) complete — stopping.")
+            self.stop(f"Reached target ({self._target_cycles} cycles)")
+            return
         target_interval_ms = self._scan_interval_min * 60 * 1000
         elapsed_ms = int((datetime.now() - self._cycle_start_time).total_seconds() * 1000)
         remaining_ms = max(1000, target_interval_ms - elapsed_ms)
@@ -1554,10 +1576,10 @@ class SpiralScanController(QObject):
     # ═══════════════════════════════════════════════════════════════
 
     def _get_scan_corners(self):
-        """Return the four corner tile coordinates of the current 5×5 scan grid."""
-        c0 = self._center_col - self.SCAN_SIZE // 2
-        r0 = self._center_row - self.SCAN_SIZE // 2
-        half = (self.SCAN_SIZE - 1)  # 4 for 5×5
+        """Return the four corner tile coordinates of the current scan grid."""
+        c0 = self._center_col - self._scan_size // 2
+        r0 = self._center_row - self._scan_size // 2
+        half = (self._scan_size - 1)
         return {
             (c0, r0),
             (c0 + half, r0),

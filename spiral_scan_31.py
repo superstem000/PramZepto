@@ -175,8 +175,10 @@ class SpiralScanController(QObject):
         self._last_fine_frame = None
         self._cycle_start_time = None
         self._scan_interval_min = 5        # default 5 minutes, configurable
-        self._center_col = self.SCAN_OFFSET_COL + self.SCAN_SIZE // 2  # center of 31x31 = 15
-        self._center_row = self.SCAN_OFFSET_ROW + self.SCAN_SIZE // 2
+        self._scan_size = self.SCAN_SIZE   # configurable per-session (odd, >=3)
+        self._target_cycles = 0            # 0 = unlimited; >0 = stop after N cycles
+        self._center_col = self.SCAN_OFFSET_COL + self._scan_size // 2
+        self._center_row = self.SCAN_OFFSET_ROW + self._scan_size // 2
         # Corner bounds: record XY at each corner to clamp motion limits
         self._corner_positions = {}  # (col, row) -> (x_fs, y_fs)
         self._corners_set = set()
@@ -220,12 +222,27 @@ class SpiralScanController(QObject):
             return True
         return False
 
-    def configure(self, interval_min=None, center_col=None, center_row=None):
-        """Configure scan interval. Center position is ignored — full 31x31 grid."""
+    def configure(self, interval_min=None, center_col=None, center_row=None,
+                  scan_size=None, num_cycles=None):
+        """Configure scan interval, size, and target cycle count.
+        center_col/center_row ignored — always scans from the configured offset.
+
+        scan_size: odd int >=3 (e.g. 5, 7, 31).
+        num_cycles: 0 = unlimited (default); >0 = stop after N cycles.
+        """
         if interval_min is not None:
             # Temporarily hardcoded to 2 min regardless of UI setting
             self._scan_interval_min = 5
-        # center_col/center_row ignored — always scan full grid from center
+        if scan_size is not None:
+            s = int(scan_size)
+            if s < 3: s = 3
+            if s > self.GRID_SIZE: s = self.GRID_SIZE
+            if s % 2 == 0: s += 1  # force odd
+            self._scan_size = s
+            self._center_col = self.SCAN_OFFSET_COL + self._scan_size // 2
+            self._center_row = self.SCAN_OFFSET_ROW + self._scan_size // 2
+        if num_cycles is not None:
+            self._target_cycles = max(0, int(num_cycles))
 
     def start(self, camera_settings, output_dir=""):
         if self._active: return
@@ -985,7 +1002,7 @@ class SpiralScanController(QObject):
 
     def _start_spiral(self):
         self._spiral_path = generate_spiral_path(
-            self.SCAN_SIZE, self.SCAN_OFFSET_COL, self.SCAN_OFFSET_ROW)
+            self._scan_size, self.SCAN_OFFSET_COL, self.SCAN_OFFSET_ROW)
         self._spiral_idx = 0
         self._cycle_count += 1
         self._tiles_since_af = 0
@@ -1129,6 +1146,11 @@ class SpiralScanController(QObject):
 
     def _wait_for_next_cycle(self):
         if self._stop_requested: return
+        # Target-cycles cap: stop instead of scheduling next cycle.
+        if self._target_cycles > 0 and self._cycle_count >= self._target_cycles:
+            print(f"[FullScan] Target {self._target_cycles} cycle(s) complete — stopping.")
+            self.stop(f"Reached target ({self._target_cycles} cycles)")
+            return
         # Stitch temporarily disabled
         # self.progress.emit('stitching', f'Stitching cycle {self._cycle_count}...')
         # import threading
@@ -1310,7 +1332,7 @@ class SpiralScanController(QObject):
         """Return the four corner tile coordinates of the current scan grid."""
         c0 = self.SCAN_OFFSET_COL
         r0 = self.SCAN_OFFSET_ROW
-        half = (self.SCAN_SIZE - 1)  # 30 for a 31x31 grid
+        half = (self._scan_size - 1)
         return {
             (c0, r0),
             (c0 + half, r0),

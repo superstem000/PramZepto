@@ -401,12 +401,15 @@ class FreeModeScreen(QWidget):
         if self._spiral_scan.is_active():
             self._spiral_scan.stop("Stopped by user")
     
-    def _on_spiral_scan_settings(self, interval_min: int, center_col: int, center_row: int):
+    def _on_spiral_scan_settings(self, interval_min: int, center_col: int,
+                                  center_row: int, scan_size: int, num_cycles: int):
         """Apply scan settings before scan starts."""
         self._spiral_scan.configure(
             interval_min=interval_min,
             center_col=center_col,
-            center_row=center_row
+            center_row=center_row,
+            scan_size=scan_size,
+            num_cycles=num_cycles,
         )
 
     def _on_spiral_progress(self, phase: str, message: str):

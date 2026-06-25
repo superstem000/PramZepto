@@ -48,6 +48,9 @@ class RecipeStep:
     override_z_limit: bool = False  # bypass z_global_max safety bound
     run_calibration_during_dwell: bool = False  # kick off orient_cal at dwell start;
                                                 # if cal still running when dwell ends, wait for it
+    # spiral_scan-only fields
+    num_cycles: int = 1           # how many full cycles before advancing (0 = until stopped)
+    scan_size: int = 5            # odd N for an N×N scan
     note: str = ""
 
 
@@ -514,10 +517,24 @@ class MovePlannerWidget(QWidget):
         self._set_status("Added microfluidics step.")
 
     def _on_add_spiral_scan(self):
+        # Pull current scan_size + cycles from stepper widget as defaults;
+        # default cycles to 1 if the stepper has 0 (unlimited) so a sequence
+        # step terminates.
+        size_default = 5
+        cyc_default = 1
+        try:
+            s = self.stepper.get_spiral_scan_settings()
+            size_default = int(s.get('scan_size', 5))
+            cyc_default = int(s.get('num_cycles', 0)) or 1
+        except Exception:
+            pass
         step = RecipeStep(
             step_type="spiral_scan",
             dwell_ms=self.dwell_ms.value(),
-            note="Spiral scan (one cycle, settings from stepper widget)",
+            num_cycles=cyc_default,
+            scan_size=size_default,
+            note=f"Spiral scan ({size_default}×{size_default}, {cyc_default} cycle"
+                 f"{'s' if cyc_default != 1 else ''})",
         )
         self._add_step_to_table(step)
         self._set_status("Added spiral scan step.")
@@ -547,8 +564,12 @@ class MovePlannerWidget(QWidget):
         elif step.step_type == "spiral_scan":
             type_item = QTableWidgetItem("Scan")
             type_item.setBackground(Qt.GlobalColor.darkBlue)
-            for c in (2, 3, 4, 5):
-                self.table.setItem(r, c, QTableWidgetItem("—"))
+            # Use X column for grid size, Y column for cycle count; Z/Speed stay "—"
+            self.table.setItem(r, 2, QTableWidgetItem(f"{step.scan_size}×{step.scan_size}"))
+            cyc_text = f"{step.num_cycles} cyc" if step.num_cycles > 0 else "∞"
+            self.table.setItem(r, 3, QTableWidgetItem(cyc_text))
+            self.table.setItem(r, 4, QTableWidgetItem("—"))
+            self.table.setItem(r, 5, QTableWidgetItem("—"))
             self.table.setItem(r, 6, QTableWidgetItem(str(step.dwell_ms) if step.dwell_ms else ""))
 
         self.table.setItem(r, 1, type_item)
@@ -658,6 +679,8 @@ class MovePlannerWidget(QWidget):
                             override_z_limit=bool(st.get("override_z_limit", False)),
                             run_calibration_during_dwell=bool(
                                 st.get("run_calibration_during_dwell", False)),
+                            num_cycles=int(st.get("num_cycles", 1) or 1),
+                            scan_size=int(st.get("scan_size", 5) or 5),
                             note=str(st.get("note", "") or ""),
                         ))
                     else:
@@ -671,6 +694,8 @@ class MovePlannerWidget(QWidget):
                             override_z_limit=bool(st.get("override_z_limit", False)),
                             run_calibration_during_dwell=bool(
                                 st.get("run_calibration_during_dwell", False)),
+                            num_cycles=int(st.get("num_cycles", 1) or 1),
+                            scan_size=int(st.get("scan_size", 5) or 5),
                             note=str(st.get("note", "") or ""),
                         ))
                 self._recipes[name] = MoveRecipe(name=name, steps=steps)
@@ -1026,12 +1051,15 @@ class MovePlannerWidget(QWidget):
             print(f"[Planner] Spiral scan settings provider failed: {e}, "
                   f"using defaults ({interval_min}min, {center_col},{center_row})")
 
-        # Configure the scan
+        # Configure the scan — scan_size + num_cycles come from the step itself
+        # (so each spiral_scan step in a sequence can have its own settings).
         try:
             self._spiral_scan.configure(
                 interval_min=interval_min,
                 center_col=center_col,
                 center_row=center_row,
+                scan_size=int(getattr(step, 'scan_size', 5)),
+                num_cycles=int(getattr(step, 'num_cycles', 1)),
             )
         except Exception as e:
             print(f"[Planner] spiral_scan.configure failed: {e}")
@@ -1133,27 +1161,17 @@ class MovePlannerWidget(QWidget):
             self._finish_execution(f"Spiral scan start failed: {e}")
 
     def _on_spiral_scan_progress(self, phase, message):
-        """Detect cycle completion by watching for phase=='waiting'. The scan
-        controller enters that phase after finishing one full cycle (including
-        return to center and final fine-correct), right before the inter-cycle
-        timer would normally fire."""
+        """Status passthrough while the scan runs. Termination after N cycles
+        is owned by the controller itself (configure(num_cycles=N) makes it
+        stop after N completed cycles), which fires finished → advance."""
         if not self._spiral_scan_running_for_step:
             return
         if not self._exec_active:
             return
         if phase == 'waiting':
-            print("[Planner] Spiral scan cycle complete; continuing interval scan.")
             self._set_status(
                 f"Step {self._exec_index + 1}: Spiral Scan running. {message}"
             )
-            return
-            # try:
-            #     if self._spiral_scan is not None and self._spiral_scan.is_active():
-            #         self._spiral_scan.stop("Recipe step complete (one cycle)")
-            # except Exception as e:
-            #     print(f"[Planner] Error stopping spiral scan after cycle: {e}")
-            # stop() will fire `finished` synchronously which lands in
-            # _on_spiral_scan_finished — that handles the advance.
 
     def _on_spiral_scan_finished(self, success, message):
         """Handle the scan's finished signal. Fires when:

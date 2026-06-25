@@ -21,7 +21,8 @@ class StepperMotorsWidget(QWidget):
     move_to_feature_requested = Signal(int, int)  # col, row
     spiral_scan_requested = Signal()
     spiral_scan_stop_requested = Signal()
-    spiral_scan_settings_changed = Signal(int, int, int)  # interval_min, center_col, center_row
+    spiral_scan_settings_changed = Signal(int, int, int, int, int)
+    # interval_min, center_col, center_row, scan_size, num_cycles (0=unlimited)
 
     def __init__(self, parent_layout, config, mc):
         super().__init__()
@@ -291,6 +292,31 @@ class StepperMotorsWidget(QWidget):
         center_row_layout.addWidget(self.scan_center_row_spin)
         center_row_layout.addStretch()
         scan_layout.addLayout(center_row_layout)
+
+        # Scan size (odd, 3..31)
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Scan size:"))
+        self.scan_size_combo = QComboBox()
+        self.scan_size_combo.addItems(["3", "5", "7", "9", "11", "15", "21", "31"])
+        self.scan_size_combo.setCurrentText("5")
+        self.scan_size_combo.setFixedWidth(70)
+        size_row.addWidget(self.scan_size_combo)
+        size_row.addWidget(QLabel("× size"))
+        size_row.addStretch()
+        scan_layout.addLayout(size_row)
+
+        # Cycle count (0 = run until stopped)
+        cycles_row = QHBoxLayout()
+        cycles_row.addWidget(QLabel("Cycles:"))
+        self.scan_cycles_spin = QSpinBox()
+        self.scan_cycles_spin.setRange(0, 999)
+        self.scan_cycles_spin.setValue(0)
+        self.scan_cycles_spin.setFixedWidth(80)
+        self.scan_cycles_spin.setSpecialValueText("∞")
+        cycles_row.addWidget(self.scan_cycles_spin)
+        cycles_row.addWidget(QLabel("(0 = until stopped)"))
+        cycles_row.addStretch()
+        scan_layout.addLayout(cycles_row)
 
         parent_layout.addWidget(scan_settings)
 
@@ -606,8 +632,21 @@ class StepperMotorsWidget(QWidget):
         interval = int(self.scan_interval_combo.currentText())
         center_col = self.scan_center_col_spin.value()
         center_row = self.scan_center_row_spin.value()
-        self.spiral_scan_settings_changed.emit(interval, center_col, center_row)
+        scan_size = int(self.scan_size_combo.currentText())
+        num_cycles = self.scan_cycles_spin.value()
+        self.spiral_scan_settings_changed.emit(
+            interval, center_col, center_row, scan_size, num_cycles)
         self.spiral_scan_requested.emit()
+
+    def get_spiral_scan_settings(self) -> dict:
+        """Snapshot of current scan settings — used by the planner/recipe step."""
+        return {
+            'interval_min': int(self.scan_interval_combo.currentText()),
+            'center_col': self.scan_center_col_spin.value(),
+            'center_row': self.scan_center_row_spin.value(),
+            'scan_size': int(self.scan_size_combo.currentText()),
+            'num_cycles': self.scan_cycles_spin.value(),
+        }
 
     def end_spiral_scan(self, success: bool, message: str):
         """Called by parent screen when spiral scan finishes or is stopped."""
