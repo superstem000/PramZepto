@@ -215,7 +215,7 @@ class StageCalibration(QObject):
     SETTLE_MS = 400
     DISCARD_FRAMES = 3
     PROBE_DISTANCE_FS = 10.0
-    DETECTION_THRESHOLD = 50
+    DETECTION_THRESHOLD = 20
 
     PROBE_BY_MRES = {
         1: 30.0, 2: 25.0, 4: 20.0, 8: 18.0, 16: 10.0, 32: 10.0,

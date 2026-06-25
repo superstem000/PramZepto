@@ -53,9 +53,9 @@
     "y_full_step_max": 5200,
     "z_full_step_min": 0,
     "z_full_step_max": 1200,
-    "x_current_position_full_step": 4173.46875,
-    "y_current_position_full_step": 527.65625,
-    "z_current_position_full_step": 144.9375
+    "x_current_position_full_step": 4154.09375,
+    "y_current_position_full_step": 586.75,
+    "z_current_position_full_step": 151.9375
   },
   "endstops": {
     "chip": 0,
@@ -79,7 +79,7 @@
     "min_speed_fullstep": 3
   },
   "safety_bounds": {
-    "z_global_max": 2000.0,
+    "z_global_max": 85.0,
     "xy_forbidden_x": 3800.0,
     "xy_forbidden_y": 850.0,
     "z_safe_rect": {

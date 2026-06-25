@@ -67,7 +67,7 @@ MICROFLUIDICS_SEQUENCE = [
                speed=2.67, override_z_limit=True),
     # Fast approach
     RecipeStep(step_type="move", x_us=21000, y_us=19270, z_us=22589,
-               speed=2.67, override_z_limit=True),
+               speed=0.02, override_z_limit=True),
     # Slow push
     RecipeStep(step_type="move", x_us=10677, y_us=19270, z_us=22589,
                speed=0.02, override_z_limit=True),
@@ -87,7 +87,7 @@ MICROFLUIDICS_SEQUENCE = [
                speed=2.67, override_z_limit=True),
     # Fast approach
     RecipeStep(step_type="move", x_us=21000, y_us=36986, z_us=22589,
-               speed=2.67, override_z_limit=True),
+               speed=0.02, override_z_limit=True),
     # Slow push
     RecipeStep(step_type="move", x_us=10677, y_us=36986, z_us=22589,
                speed=0.02, override_z_limit=True),
@@ -1142,14 +1142,16 @@ class MovePlannerWidget(QWidget):
         if not self._exec_active:
             return
         if phase == 'waiting':
-            print(f"[Planner] Spiral scan cycle complete, stopping scan and "
-                  f"advancing recipe.")
-            # Stop the scan so it doesn't wait for the inter-cycle timer
-            try:
-                if self._spiral_scan is not None and self._spiral_scan.is_active():
-                    self._spiral_scan.stop("Recipe step complete (one cycle)")
-            except Exception as e:
-                print(f"[Planner] Error stopping spiral scan after cycle: {e}")
+            print("[Planner] Spiral scan cycle complete; continuing interval scan.")
+            self._set_status(
+                f"Step {self._exec_index + 1}: Spiral Scan running. {message}"
+            )
+            return
+            # try:
+            #     if self._spiral_scan is not None and self._spiral_scan.is_active():
+            #         self._spiral_scan.stop("Recipe step complete (one cycle)")
+            # except Exception as e:
+            #     print(f"[Planner] Error stopping spiral scan after cycle: {e}")
             # stop() will fire `finished` synchronously which lands in
             # _on_spiral_scan_finished — that handles the advance.
 

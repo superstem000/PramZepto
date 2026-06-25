@@ -91,7 +91,7 @@ class SpiralScanController(QObject):
     SETTLE_MS = 200
     DISCARD_FRAMES = 1
     GRID_SIZE = 31          # full grid size (for detection/calibration)
-    SCAN_SIZE = 31           # 5×5 scan
+    SCAN_SIZE = 5           # 5×5 scan
     SKIP_THRESHOLD_FS = 2.0
     MAX_FINE_ERROR_FS = 5.0
     MAX_RECOVERY_ATTEMPTS = 3
@@ -1307,6 +1307,8 @@ class SpiralScanController(QObject):
     # ═══════════════════════════════════════════════════════════════
 
     def _start_spiral(self):
+        if self._stop_requested or not self._active:
+            return
         # 5×5 grid centered on _center_col/_center_row
         offset_col = self._center_col - self.SCAN_SIZE // 2
         offset_row = self._center_row - self.SCAN_SIZE // 2
@@ -1384,6 +1386,8 @@ class SpiralScanController(QObject):
         remaining_min = remaining_ms / 60000
         print(f"[DemoScan] Cycle took {elapsed_ms/1000:.0f}s, waiting {remaining_min:.1f} min for next...")
         self.progress.emit('waiting', f'Next scan in {remaining_min:.1f} minutes...')
+        if self._stop_requested or not self._active:
+            return
         QTimer.singleShot(remaining_ms, self._start_spiral)
     
     def _on_spiral_arrived(self):

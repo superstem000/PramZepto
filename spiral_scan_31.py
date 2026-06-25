@@ -91,7 +91,7 @@ class SpiralScanController(QObject):
     SETTLE_MS = 200
     DISCARD_FRAMES = 1
     GRID_SIZE = 31          # full grid size (for detection/calibration)
-    SCAN_SIZE = 31          # scan the full grid
+    SCAN_SIZE = 5          # scan the full grid
     SCAN_OFFSET_COL = 0     # (0,0) to (30,30)
     SCAN_OFFSET_ROW = 0
     SKIP_THRESHOLD_FS = 2.0
@@ -173,7 +173,7 @@ class SpiralScanController(QObject):
         self.af_controller.finished.connect(self._on_af_finished)
         self._last_fine_frame = None
         self._cycle_start_time = None
-        self._scan_interval_min = 2        # default 5 minutes, configurable
+        self._scan_interval_min = 5        # default 5 minutes, configurable
         self._center_col = self.SCAN_OFFSET_COL + self.SCAN_SIZE // 2  # center of 31x31 = 15
         self._center_row = self.SCAN_OFFSET_ROW + self.SCAN_SIZE // 2
         # Corner bounds: record XY at each corner to clamp motion limits
@@ -223,7 +223,7 @@ class SpiralScanController(QObject):
         """Configure scan interval. Center position is ignored — full 31x31 grid."""
         if interval_min is not None:
             # Temporarily hardcoded to 2 min regardless of UI setting
-            self._scan_interval_min = 2
+            self._scan_interval_min = 5
         # center_col/center_row ignored — always scan full grid from center
 
     def start(self, camera_settings, output_dir=""):

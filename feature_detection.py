@@ -5,10 +5,10 @@ import cv2
 from typing import List, Dict, Optional
 
 # ── Configuration ──────────────────────────────────────────────────
-DEFAULT_THRESHOLD = 50
+DEFAULT_THRESHOLD = 20
 MIN_FEATURE_AREA = 1500
 MAX_FEATURE_AREA = 60000
-CLUSTER_DISTANCE = 800
+CLUSTER_DISTANCE = 300
 MIN_CLUSTER_SIZE = 7
 MAX_GROUPS = 4
 GRID_ROWS = 2

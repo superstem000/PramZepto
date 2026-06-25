@@ -1,0 +1,8 @@
+Image: test2.jpg (4056x3040)
+Threshold: 20
+Components: 28
+Clusters: 2
+Markers: 2
+
+(3,3) px=(2483,593) conf=1.633
+(3,4) px=(2492,2515) conf=1.470
