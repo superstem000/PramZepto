@@ -1,0 +1,8 @@
+Image: 2026.06.26/2026.06.26_04.05.53_image.jpg (4056x3040)
+Threshold: 20
+Components: 34
+Clusters: 3
+Markers: 2
+
+(18,22) px=(2738,210) conf=1.343
+(18,23) px=(2786,2133) conf=1.633
