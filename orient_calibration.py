@@ -247,6 +247,10 @@ class OrientCalibrationController(QObject):
 
     DETECTION_THRESHOLD = DETECTION_THRESHOLD
 
+    # Cap-bounded reference detection
+    MAX_REFERENCE_RETRIES = 5
+    REFERENCE_RETRY_DELAY_MS = 300
+
     def __init__(self, move_to_ctrl, camera_preview, mc, motors_model,
                  config=None, af_controller=None, homing=None, parent=None):
         super().__init__(parent)
@@ -494,9 +498,18 @@ class OrientCalibrationController(QObject):
         markers = self._detect_raw(frame)
         if not markers:
             p = save_failed_frame(frame, "orient_reference")
-            print(f"[OrientCal] No markers at safe center — saved {p}")
+            self._ref_retries = getattr(self, '_ref_retries', 0) + 1
+            if self._ref_retries < self.MAX_REFERENCE_RETRIES:
+                print(f"[OrientCal] No markers at safe center — retry "
+                      f"{self._ref_retries}/{self.MAX_REFERENCE_RETRIES} "
+                      f"(saved {p})")
+                QTimer.singleShot(self.REFERENCE_RETRY_DELAY_MS, self._capture_reference)
+                return
+            print(f"[OrientCal] No markers after {self._ref_retries} retries — saved {p}")
+            self._ref_retries = 0
             self.stop("No markers visible at safe center.")
             return
+        self._ref_retries = 0
 
         print(f"[OrientCal] Reference: {len(markers)} markers at center")
         for m in markers:

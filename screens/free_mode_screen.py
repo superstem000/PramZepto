@@ -28,7 +28,9 @@ class FreeModeScreen(QWidget):
         self.mc = mc
         self.shared_stepper_widget = shared_stepper_widget
         
-        self._live_running = False
+        # Canonical preview state lives in self.camera_preview.is_running();
+        # don't shadow it with a screen-local flag (it drifts on screen-switch
+        # and on any stop_preview call we don't make ourselves).
         self._build_ui()
         self._init_autofocus()
         self._init_calibration()
@@ -114,7 +116,7 @@ class FreeModeScreen(QWidget):
             self._orient_cal.stop("Navigated away")
         if hasattr(self, '_calibration') and self._calibration.is_active():
             self._calibration.stop("Navigated away")
-        if self._live_running:
+        if self.camera_preview.is_running():
             reply = QMessageBox.question(
                 self, "Confirm",
                 "Live preview is running. Stop and return to home?",
@@ -134,7 +136,6 @@ class FreeModeScreen(QWidget):
     def _start_live(self):
         try:
             self.camera_preview.start_preview(self._camera_controls.get_camera_settings())
-            self._live_running = True
             self._camera_controls.set_live_state(True)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to start live preview:\n{e}")
@@ -145,12 +146,11 @@ class FreeModeScreen(QWidget):
             self.camera_preview.stop_preview()
         except Exception as e:
             print(f"FreeModeScreen: Error stopping preview: {e}")
-        
-        self._live_running = False
+
         self._camera_controls.set_live_state(False)
 
     def _on_capture(self):
-        if not self._live_running:
+        if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning", "Start live preview before capturing.")
             return
         try:
@@ -190,7 +190,7 @@ class FreeModeScreen(QWidget):
 
     def _on_af_requested(self):
         """Handle Auto Focus button press."""
-        if not self._live_running:
+        if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning",
                                 "Start live preview before autofocusing.")
             self.shared_stepper_widget.end_autofocus(False, "No live preview")
@@ -267,7 +267,7 @@ class FreeModeScreen(QWidget):
 
     def _on_cal_requested(self):
         """Handle Calibrate Stage button press — runs orientation + calibration."""
-        if not self._live_running:
+        if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning",
                                 "Start live preview before calibrating.")
             self.shared_stepper_widget.end_calibration(False, "No live preview")
@@ -295,7 +295,7 @@ class FreeModeScreen(QWidget):
 
     def _on_move_to_feature_requested(self, col: int, row: int):
         """Handle Move to Feature request — triggers detection preview first."""
-        if not self._live_running:
+        if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning",
                                 "Start live preview before moving to feature.")
             self.shared_stepper_widget.end_calibration(False, "No live preview")
@@ -383,7 +383,7 @@ class FreeModeScreen(QWidget):
 
     def _on_spiral_scan_requested(self):
         """Handle Spiral Scan button press."""
-        if not self._live_running:
+        if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning",
                                 "Start live preview before scanning.")
             self.shared_stepper_widget.end_spiral_scan(False, "No live preview")
@@ -427,6 +427,13 @@ class FreeModeScreen(QWidget):
     def on_enter(self):
         if self.shared_stepper_widget and self.shared_stepper_widget.motor_group:
             self.stepper_placeholder_layout.addWidget(self.shared_stepper_widget.motor_group)
+        # Sync the camera-control toggle UI to whatever the camera is actually
+        # doing right now (the preview may have been started/stopped on a
+        # different screen before we landed here).
+        try:
+            self._camera_controls.set_live_state(self.camera_preview.is_running())
+        except Exception:
+            pass
 
     def on_leave(self):
         if hasattr(self, '_af_controller') and self._af_controller.is_active():

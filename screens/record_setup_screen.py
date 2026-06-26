@@ -53,7 +53,9 @@ class RecordSetupScreen(QWidget):
         self.mc = mc
         self.shared_stepper_widget = shared_stepper_widget
 
-        self._live_running = False
+        # Canonical preview state lives in self.camera_preview.is_running();
+        # don't shadow it with a screen-local flag (it drifts on screen-switch
+        # and on any stop_preview call we don't make ourselves).
         self._build_ui()
         self._init_autofocus()
         self._init_calibration()
@@ -184,7 +186,6 @@ class RecordSetupScreen(QWidget):
     def _start_live(self):
         try:
             self.camera_preview.start_preview(self._camera_controls.get_camera_settings())
-            self._live_running = True
             self._camera_controls.set_live_state(True)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to start live preview:\n{e}")
@@ -195,11 +196,10 @@ class RecordSetupScreen(QWidget):
             self.camera_preview.stop_preview()
         except Exception as e:
             print(f"RecordSetupScreen: Error stopping preview: {e}")
-        self._live_running = False
         self._camera_controls.set_live_state(False)
 
     def _on_capture(self):
-        if not self._live_running:
+        if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning", "Start live preview before capturing.")
             return
         try:
@@ -239,7 +239,7 @@ class RecordSetupScreen(QWidget):
     def _on_af_requested(self):
         if not self.isVisible():
             return
-        if not self._live_running:
+        if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning",
                                 "Start live preview before autofocusing.")
             self.shared_stepper_widget.end_autofocus(False, "No live preview")
@@ -311,7 +311,7 @@ class RecordSetupScreen(QWidget):
         """Calibrate Stage button — same flow as FreeModeScreen."""
         if not self.isVisible():
             return
-        if not self._live_running:
+        if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning",
                                 "Start live preview before calibrating.")
             self.shared_stepper_widget.end_calibration(False, "No live preview")
@@ -341,7 +341,7 @@ class RecordSetupScreen(QWidget):
     def _on_move_to_feature_requested(self, col: int, row: int):
         if not self.isVisible():
             return
-        if not self._live_running:
+        if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning",
                                 "Start live preview before moving to feature.")
             self.shared_stepper_widget.end_calibration(False, "No live preview")
@@ -420,7 +420,7 @@ class RecordSetupScreen(QWidget):
     def _on_spiral_scan_requested(self):
         if not self.isVisible():
             return
-        if not self._live_running:
+        if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning",
                                 "Start live preview before scanning.")
             self.shared_stepper_widget.end_spiral_scan(False, "No live preview")
@@ -525,7 +525,7 @@ class RecordSetupScreen(QWidget):
         except Exception:
             needs_scan = False
 
-        if (needs_cal or needs_scan) and not self._live_running:
+        if (needs_cal or needs_scan) and not self.camera_preview.is_running():
             QMessageBox.warning(
                 self, "Live Preview Required",
                 "This recipe needs the live camera preview "
@@ -566,7 +566,7 @@ class RecordSetupScreen(QWidget):
             except Exception:
                 pass
 
-        if self._live_running:
+        if self.camera_preview.is_running():
             reply = QMessageBox.question(
                 self, "Confirm",
                 "Live preview is running. Stop and return to home?",
@@ -585,7 +585,7 @@ class RecordSetupScreen(QWidget):
                                 "Please select a folder to save recordings.")
             return
         # Recording owns the camera, so release it here first
-        if self._live_running:
+        if self.camera_preview.is_running():
             self._stop_live()
         self.start_recording_requested.emit()
 
@@ -601,6 +601,12 @@ class RecordSetupScreen(QWidget):
     def on_enter(self):
         if self.shared_stepper_widget and self.shared_stepper_widget.motor_group:
             self.stepper_placeholder_layout.addWidget(self.shared_stepper_widget.motor_group)
+        # Sync the camera-control toggle UI to actual camera state — the
+        # preview may have been started or stopped on another screen.
+        try:
+            self._camera_controls.set_live_state(self.camera_preview.is_running())
+        except Exception:
+            pass
 
     def on_leave(self):
         # Mirror FreeModeScreen.on_leave so the camera is fully released

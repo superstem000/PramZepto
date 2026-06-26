@@ -223,6 +223,11 @@ class StageCalibration(QObject):
 
     MAX_MOVE_FS = 4000.0
 
+    # Cap-bounded reference-detection: try MAX_REFERENCE_RETRIES AF+recapture
+    # rounds before aborting the calibration. Each retry settles + recaptures.
+    MAX_REFERENCE_RETRIES = 5
+    REFERENCE_RETRY_DELAY_MS = 300
+
     def __init__(self, move_to_ctrl, camera_preview, mc, motors_config,
                  config=None, detection_threshold: int = 50, af_controller=None, parent=None):
         super().__init__(parent)
@@ -412,10 +417,19 @@ class StageCalibration(QObject):
         markers = detect_markers(frame, threshold=self.DETECTION_THRESHOLD, debug=True)
         if not markers:
             p = save_failed_frame(frame, "cal_initial")
-            print(f"[Cal] No markers visible — saved {p}")
+            self._initial_retries = getattr(self, '_initial_retries', 0) + 1
+            if self._initial_retries < self.MAX_REFERENCE_RETRIES:
+                print(f"[Cal] No markers at initial — retry "
+                      f"{self._initial_retries}/{self.MAX_REFERENCE_RETRIES} "
+                      f"(saved {p})")
+                QTimer.singleShot(self.REFERENCE_RETRY_DELAY_MS, self._do_move_detection)
+                return
+            print(f"[Cal] No markers after {self._initial_retries} retries — saved {p}")
+            self._initial_retries = 0
             self._active = False
             self.finished.emit(False, "No markers visible.", None)
             return
+        self._initial_retries = 0
 
         markers = self._filter_suspicious_markers(markers)
 
@@ -554,9 +568,18 @@ class StageCalibration(QObject):
         markers = detect_markers(frame, threshold=self.DETECTION_THRESHOLD, debug=True)
         if not markers:
             p = save_failed_frame(frame, "cal_reference")
-            print(f"[Cal] No markers at reference position — saved {p}")
+            self._ref_retries = getattr(self, '_ref_retries', 0) + 1
+            if self._ref_retries < self.MAX_REFERENCE_RETRIES:
+                print(f"[Cal] No markers at reference — retry "
+                      f"{self._ref_retries}/{self.MAX_REFERENCE_RETRIES} "
+                      f"(saved {p})")
+                QTimer.singleShot(self.REFERENCE_RETRY_DELAY_MS, self._capture_reference)
+                return
+            print(f"[Cal] No markers at reference after {self._ref_retries} retries — saved {p}")
+            self._ref_retries = 0
             self.stop("No markers at reference position.")
             return
+        self._ref_retries = 0
 
         self._ref_markers = markers
         print(f"[Cal] Reference: {len(markers)} marker(s)")
@@ -585,9 +608,22 @@ class StageCalibration(QObject):
         markers = detect_markers(frame, threshold=self.DETECTION_THRESHOLD, debug=True)
         if not markers:
             p = save_failed_frame(frame, f"cal_probe_{axis_label}")
-            print(f"[Cal] No markers after {axis_label} probe — saved {p}")
+            self._probe_retries = getattr(self, '_probe_retries', 0) + 1
+            if self._probe_retries < self.MAX_REFERENCE_RETRIES:
+                print(f"[Cal] No markers after {axis_label} probe — retry "
+                      f"{self._probe_retries}/{self.MAX_REFERENCE_RETRIES} "
+                      f"(saved {p})")
+                # Re-dispatch this same probe-capture after a settle delay.
+                cb = getattr(self, f"_capture_{axis_label.lower()}_probe", None)
+                if cb:
+                    QTimer.singleShot(self.REFERENCE_RETRY_DELAY_MS, cb)
+                    return None
+            print(f"[Cal] No markers after {axis_label} probe "
+                  f"({self._probe_retries} retries) — saved {p}")
+            self._probe_retries = 0
             self.stop(f"No markers after {axis_label} probe.")
             return None
+        self._probe_retries = 0
 
         matched = self._match_markers(self._ref_markers, markers)
         if not matched:

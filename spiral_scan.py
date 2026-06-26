@@ -106,7 +106,19 @@ class SpiralScanController(QObject):
     DZ_PER_TILE = -0.03
     AF_MODE = 'minimal'
     SCAN_SPEED_MULTIPLIER = 0.5
-    DEAD_TILE_RESTARTS = 10   # consecutive localize failures before a tile is skipped
+
+    # ── Retry caps (uniform = 5 attempts before skip/halt) ────────────────
+    MAX_LOCALIZE_RETRIES  = 5    # detection/localization failures during spiral
+    MAX_MOVE_CAP_RETRIES  = 5    # MOVE CAP target-out-of-bounds loop
+    MAX_WALK_RETRIES      = 5    # detection failures during walk-to-target
+    MAX_COLD_AF_RETRIES   = 5    # detect at safe-center after cold AF
+    MAX_CONSECUTIVE_SKIPS = 4    # halt the scan if N tiles skip in a row
+    # AF range escalation: fewer retries, bigger jumps per retry (fs).
+    # Indexed by (retry_count - 1); clamps at the last entry.
+    AF_RANGE_STEPS_FS     = [1.0, 2.5, 5.0, 7.5, 10.0]
+    # Kept for backwards-compatibility with any external reference; equals
+    # MAX_LOCALIZE_RETRIES now (was 10 pre-cap-tightening).
+    DEAD_TILE_RESTARTS = 5
 
     def __init__(self, calibration, af_controller, move_to_ctrl,
                  camera_preview, mc, motors_config, config, parent=None):
@@ -198,6 +210,9 @@ class SpiralScanController(QObject):
         self._pending_z_sample = None   # staged at periodic AF, committed only on confirmation
         self._skip_candidate = None
         self._in_walk = False           # walk phase has its own bounded give-up
+        self._walk_retries = 0          # cap-bounded walk detection failures
+        self._cold_af_retries = 0       # cap-bounded cold-AF detect failures
+        self._consecutive_skips = 0     # tiles skipped in a row (capped → halt)
         self._orientation = "normal"  # updated in start()
 
     def is_active(self): return self._active
@@ -211,8 +226,13 @@ class SpiralScanController(QObject):
     BASE_AF_RANGE = 0.4
 
     def _get_af_range(self):
-        """AF range grows with consecutive failures. Starts ±0.4, +0.2 per failure, caps ±10."""
-        return min(10.0, self.BASE_AF_RANGE + self._consecutive_af_failures * 0.2)
+        """AF range grows with consecutive failures. Steeper escalation now that
+        retry caps are 5 instead of ~10 — see AF_RANGE_STEPS_FS."""
+        n = self._consecutive_af_failures
+        if n <= 0:
+            return self.BASE_AF_RANGE
+        idx = min(n - 1, len(self.AF_RANGE_STEPS_FS) - 1)
+        return self.AF_RANGE_STEPS_FS[idx]
 
     def _start_escalating_af(self):
         """Start AF with range based on failure count, centered on last good Z."""
@@ -327,6 +347,9 @@ class SpiralScanController(QObject):
         self._corners_set = set()
         self._scan_bounds_applied = False
         self._single_tile_af_retries = 0
+        self._walk_retries = 0
+        self._cold_af_retries = 0
+        self._consecutive_skips = 0
         self._cumulative_tiles = 0
         self._z_samples = []  # fresh samples each scan session
         self._last_good_tile = None
@@ -431,27 +454,47 @@ class SpiralScanController(QObject):
         self.af_controller.start_quick(self._camera_settings, mode='tight')
 
     def _detect_and_walk_to_center(self):
-        """After cold AF, detect current tile position and walk to scan center."""
+        """After cold AF, detect current tile position and walk to scan center.
+        Capped at MAX_COLD_AF_RETRIES — no fallback exists pre-acquisition, so
+        on cap we halt with a clear error rather than looping forever."""
         if self._stop_requested: return
+
+        def _cold_fail(reason):
+            self._cold_af_retries += 1
+            if self._cold_af_retries > self.MAX_COLD_AF_RETRIES:
+                self.stop(f"Cannot detect at scan center after "
+                          f"{self._cold_af_retries - 1} retries ({reason})")
+                return True
+            return False
+
         cal = self.calibration.get_result()
         frame = self.camera_preview.flush_and_capture(
             self._camera_settings, discard=self.DISCARD_FRAMES)
         if frame is None:
-            print(f"[DemoScan] No frame after cold AF — retrying")
+            if _cold_fail("no frame"): return
+            print(f"[DemoScan] No frame after cold AF — retrying "
+                  f"({self._cold_af_retries}/{self.MAX_COLD_AF_RETRIES})")
             QTimer.singleShot(200, self._detect_and_walk_to_center)
             return
         markers = self._detect(frame)
         if not markers:
-            print(f"[DemoScan] No markers after cold AF — retrying AF")
+            if _cold_fail("no markers"): return
+            print(f"[DemoScan] No markers after cold AF — retrying AF "
+                  f"({self._cold_af_retries}/{self.MAX_COLD_AF_RETRIES})")
+            save_failed_frame(frame, "demo_coldaf_no_markers")
             self._state = 'cold_af'
             self.af_controller.start(self._camera_settings)
             return
         markers = self.calibration._filter_suspicious_markers(markers)
         if not markers:
-            print(f"[DemoScan] All markers filtered — retrying AF")
+            if _cold_fail("all filtered"): return
+            print(f"[DemoScan] All markers filtered — retrying AF "
+                  f"({self._cold_af_retries}/{self.MAX_COLD_AF_RETRIES})")
+            save_failed_frame(frame, "demo_coldaf_all_filtered")
             self._state = 'cold_af'
             self.af_controller.start(self._camera_settings)
             return
+        self._cold_af_retries = 0   # success — reset budget
         cur_col, cur_row, _, _ = self._infer_tile_at_ideal(cal, markers)
         self._last_known_col = cur_col
         self._last_known_row = cur_row
@@ -677,7 +720,14 @@ class SpiralScanController(QObject):
         # Global move cap: if active, block any XY move exceeding 2 tiles per axis
         if self._check_move_cap(motor_delta[0], motor_delta[1]):
             self._single_tile_af_retries += 1
-            print(f"[DemoScan] MOVE CAP: AF and retry (attempt {self._single_tile_af_retries})")
+            if self._single_tile_af_retries > self.MAX_MOVE_CAP_RETRIES:
+                print(f"[DemoScan] MOVE CAP: {self._single_tile_af_retries-1} retries "
+                      f"exceeded — treating as dead tile")
+                self._single_tile_af_retries = 0
+                self._skip_dead_tile()
+                return None
+            print(f"[DemoScan] MOVE CAP: AF and retry "
+                  f"(attempt {self._single_tile_af_retries}/{self.MAX_MOVE_CAP_RETRIES})")
             self._state = 'sanity_af'
             self._after_move_cb = lambda: self._detect_and_move_multi(
                 dest_col, dest_row, max_tiles, callback)
@@ -937,6 +987,8 @@ class SpiralScanController(QObject):
 
         # ── Confirmed-good tile: update single anchor, commit staged Z sample ──
         self._dead_restarts = 0
+        self._single_tile_af_retries = 0   # MOVE CAP cap budget renewed
+        self._consecutive_skips = 0        # successful tile breaks the skip streak
         gx = float(getattr(self.MOTORS, "x_current_position_full_step", 0.0))
         gy = float(getattr(self.MOTORS, "y_current_position_full_step", 0.0))
         gz = float(getattr(self.MOTORS, "z_current_position_full_step", 0.0))
@@ -968,11 +1020,11 @@ class SpiralScanController(QObject):
 
     def _on_localize_fail(self, retry_cb):
         """Single funnel for every failure that escalates AF range. Each call
-        is one range-increasing restart; during spiral acquisition they count
-        toward DEAD_TILE_RESTARTS and trigger a skip once the cap is hit. The
-        walk phase (to the first tile / back to center) is excluded — it has
-        its own bounded give-up (WALK_MAX_NO_PROGRESS) and different anchor
-        semantics — so during a walk this just escalates AF and retries."""
+        is one range-increasing restart; capped per-context:
+          - spiral acquisition: MAX_LOCALIZE_RETRIES → _skip_dead_tile()
+          - walk phase:         MAX_WALK_RETRIES    → halt (no in-walk skip
+                                target exists; aborting is safer than
+                                blind-moving to an unconfirmed tile)"""
         if self._stop_requested:
             return
         self._pending_z_sample = None  # this tile was never confirmed
@@ -980,10 +1032,16 @@ class SpiralScanController(QObject):
         in_spiral_step = self._scan_move_cap_active and not self._in_walk
         if in_spiral_step:
             self._dead_restarts += 1
-            if self._dead_restarts >= self.DEAD_TILE_RESTARTS:
+            if self._dead_restarts >= self.MAX_LOCALIZE_RETRIES:
                 print(f"[DemoScan] {self._dead_restarts} range-increasing restarts "
                       f"at target {self._current_target} — declaring dead, skipping")
                 self._skip_dead_tile()
+                return
+        elif self._in_walk:
+            self._walk_retries += 1
+            if self._walk_retries >= self.MAX_WALK_RETRIES:
+                self.stop(f"Walk: {self._walk_retries} detection-failure retries "
+                          f"exceeded — halting (cannot localise during walk)")
                 return
         self._state = 'sanity_af'
         self._after_move_cb = retry_cb
@@ -994,19 +1052,31 @@ class SpiralScanController(QObject):
         tile (blind, cap-bypassing), AF there, then open-loop hop to the next
         spiral tile and re-enter the normal flow. The anchor stays pinned to
         the last good tile, so consecutive skips (a multi-tile dead region)
-        each hop from the same known origin and errors don't accumulate."""
+        each hop from the same known origin and errors don't accumulate.
+
+        Halts the scan if MAX_CONSECUTIVE_SKIPS tiles skip in a row — at that
+        point detection is systemically broken and continuing wastes the run.
+        """
         if self._stop_requested:
             return
         if self._last_good_tile is None:
             self.stop("Dead tile with no good anchor to fall back to")
             return
 
+        self._consecutive_skips += 1
+        if self._consecutive_skips >= self.MAX_CONSECUTIVE_SKIPS:
+            self.stop(f"{self._consecutive_skips} consecutive tile skips — "
+                      f"detection appears systemically broken, halting")
+            return
+
         self._failed_tiles.add(self._current_target)
         self._log_scan(self._current_target[0], self._current_target[1], 'skipped')
-        print(f"[DemoScan] Skipping dead tile {self._current_target}")
+        print(f"[DemoScan] Skipping dead tile {self._current_target} "
+              f"({self._consecutive_skips}/{self.MAX_CONSECUTIVE_SKIPS} consecutive)")
 
         # Reset failure counters and any staged learning.
         self._dead_restarts = 0
+        self._single_tile_af_retries = 0
         self._consecutive_af_failures = 0
         self._recovery_attempts = 0
         self._pending_z_sample = None
@@ -1272,6 +1342,7 @@ class SpiralScanController(QObject):
         self._walk_target_row = target_row
         self._walk_final_cb = callback
         self._walk_no_progress = 0
+        self._walk_retries = 0   # fresh cap budget per walk
         self._walk_last_infer = None
         self._walk_step()
 
@@ -1289,6 +1360,7 @@ class SpiralScanController(QObject):
         markers = self._detect(frame)
         markers = self.calibration._filter_suspicious_markers(markers) if markers else []
         if markers:
+            self._walk_retries = 0   # detection recovered; reset cap
             cal = self.calibration.get_result()
             cur_col, cur_row, _, _ = self._infer_tile_at_ideal(cal, markers)
             if cur_col == self._walk_target_col and cur_row == self._walk_target_row:
@@ -1318,6 +1390,12 @@ class SpiralScanController(QObject):
                 self._after_move_cb = self._walk_step
                 self._start_escalating_af()
                 return
+        # No markers (or none survived filtering): cap-bounded detection-fail loop.
+        self._walk_retries += 1
+        if self._walk_retries >= self.MAX_WALK_RETRIES:
+            self.stop(f"Walk: {self._walk_retries} detection-failure retries "
+                      f"during _walk_check — halting")
+            return
         # Not there yet — AF then continue
         self._state = 'walk_af'
         self._after_move_cb = self._walk_step
