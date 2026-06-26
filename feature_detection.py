@@ -2,7 +2,7 @@ import os
 from datetime import datetime
 import numpy as np
 import cv2
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 # ── Configuration ──────────────────────────────────────────────────
 DEFAULT_THRESHOLD = 20
@@ -13,6 +13,12 @@ MIN_CLUSTER_SIZE = 7
 MAX_GROUPS = 4
 GRID_ROWS = 2
 GRID_COLS = 5
+
+# Outlier tolerance per row (after bridge-splitting). Up to this many extra
+# blobs per row will be auto-rejected via Y-band + X-template/uniformity logic.
+# 0 = behave like the old code; >0 = tolerate scratches / dust adjacent to
+# the real 2×5.
+MAX_EXTRA_PER_ROW = 2
 
 # ── Image Processing (OpenCV Optimized) ───────────────────────────
 
@@ -125,17 +131,131 @@ def cluster_components(components: List[Dict]) -> List[List[Dict]]:
 
 # ── Grid Fitting and Decoding ─────────────────────────────────────
 
-def fit_grid_to_cluster(cluster: List[Dict], binary: np.ndarray, 
+def _split_rows_robust(cluster: List[Dict], debug: bool = False
+                       ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    """Split cluster blobs into 2 Y-bands using k=2 clustering. Anything more
+    than ~40% of the inter-band gap away from either band centre is auto-
+    rejected (caller sees these as outliers).
+
+    Returns (row0_blobs, row1_blobs, out_of_band), with row0 the lower-Y band.
+    Both row lists sorted by X. Handles the "extra blob above/below the
+    marker" case that broke the old single-biggest-gap split.
+    """
+    if len(cluster) < 2:
+        return cluster, [], []
+
+    sorted_y = sorted(cluster, key=lambda c: c['centroid_y'])
+    y_vals = [c['centroid_y'] for c in sorted_y]
+    diffs = np.diff(y_vals)
+    if len(diffs) == 0:
+        return sorted_y, [], []
+
+    # Initial split at biggest Y gap, then refine via k=2 means (3 iters).
+    best_gap_idx = int(np.argmax(diffs)) + 1
+    g0 = sorted_y[:best_gap_idx]
+    g1 = sorted_y[best_gap_idx:]
+    for _ in range(3):
+        if not g0 or not g1:
+            break
+        c0 = float(np.mean([b['centroid_y'] for b in g0]))
+        c1 = float(np.mean([b['centroid_y'] for b in g1]))
+        n0, n1 = [], []
+        for b in sorted_y:
+            (n0 if abs(b['centroid_y'] - c0) <= abs(b['centroid_y'] - c1) else n1).append(b)
+        if n0 == g0 and n1 == g1:
+            break
+        g0, g1 = n0, n1
+
+    if not g0 or not g1:
+        # Degenerate (all blobs at near-same Y); pass through unchanged
+        return sorted(sorted_y, key=lambda b: b['centroid_x']), [], []
+
+    c0 = float(np.mean([b['centroid_y'] for b in g0]))
+    c1 = float(np.mean([b['centroid_y'] for b in g1]))
+    row_gap = abs(c1 - c0)
+    y_tol = max(row_gap * 0.4, 20.0)  # generous; tightens the more spread the rows are
+
+    out_of_band = []
+    row0_clean, row1_clean = [], []
+    for b in g0:
+        if abs(b['centroid_y'] - c0) <= y_tol:
+            row0_clean.append(b)
+        else:
+            out_of_band.append(b)
+    for b in g1:
+        if abs(b['centroid_y'] - c1) <= y_tol:
+            row1_clean.append(b)
+        else:
+            out_of_band.append(b)
+
+    # Ensure row0 = lower Y
+    if (row0_clean and row1_clean and
+            np.mean([b['centroid_y'] for b in row0_clean]) >
+            np.mean([b['centroid_y'] for b in row1_clean])):
+        row0_clean, row1_clean = row1_clean, row0_clean
+
+    row0_clean.sort(key=lambda b: b['centroid_x'])
+    row1_clean.sort(key=lambda b: b['centroid_x'])
+
+    if debug and out_of_band:
+        for b in out_of_band:
+            print(f"  Y-band outlier rejected at "
+                  f"px=({b['centroid_x']:.0f},{b['centroid_y']:.0f})")
+
+    return row0_clean, row1_clean, out_of_band
+
+
+def _select_5_by_template(row: List[Dict], template_xs: List[float]) -> List[Dict]:
+    """Greedy nearest-neighbour: keep the 5 blobs whose X is closest to the
+    other row's column template. Used when one row is clean (5 blobs) and
+    the other has extras — most reliable outlier rejection because it uses
+    the marker's cross-row X-alignment as ground truth."""
+    if len(row) <= GRID_COLS:
+        return row
+    remaining = list(row)
+    selected = []
+    for tx in template_xs:
+        if not remaining:
+            break
+        best = min(remaining, key=lambda b: abs(b['centroid_x'] - tx))
+        selected.append(best)
+        remaining.remove(best)
+    return sorted(selected, key=lambda b: b['centroid_x'])
+
+
+def _select_5_by_uniformity(row: List[Dict]) -> List[Dict]:
+    """Brute-force pick the 5-subset whose inter-blob X gaps are most uniform
+    (lowest coefficient of variation). Used when neither row is clean. C(N,5)
+    where N ≤ GRID_COLS + MAX_EXTRA_PER_ROW ≤ 7 → ≤ 21 subsets, trivial."""
+    from itertools import combinations
+    if len(row) <= GRID_COLS:
+        return row
+    best_subset = None
+    best_score = float('inf')
+    for combo in combinations(row, GRID_COLS):
+        sc = sorted(combo, key=lambda b: b['centroid_x'])
+        xs = np.array([b['centroid_x'] for b in sc])
+        gaps = np.diff(xs)
+        mean_gap = float(gaps.mean())
+        if mean_gap < 1:
+            continue
+        cv = float(gaps.std()) / mean_gap
+        if cv < best_score:
+            best_score = cv
+            best_subset = list(sc)
+    if best_subset is None:
+        return sorted(row, key=lambda b: b['centroid_x'])[:GRID_COLS]
+    return best_subset
+
+
+def fit_grid_to_cluster(cluster: List[Dict], binary: np.ndarray,
                         eroded: np.ndarray, debug: bool = False) -> Optional[Dict]:
     if len(cluster) < MIN_CLUSTER_SIZE: return None
 
-    # Split rows by Y
-    sorted_y = sorted(cluster, key=lambda c: c['centroid_y'])
-    y_vals = [c['centroid_y'] for c in sorted_y]
-    best_gap_idx = np.argmax(np.diff(y_vals)) + 1
-    
-    row0_blobs = sorted(sorted_y[:best_gap_idx], key=lambda c: c['centroid_x'])
-    row1_blobs = sorted(sorted_y[best_gap_idx:], key=lambda c: c['centroid_x'])
+    # Robust row split: k=2 Y-band clustering with auto-rejection of blobs
+    # outside both bands. Replaces the brittle "biggest single Y-gap" split,
+    # which mis-rowed any cluster with an extra blob above/below the marker.
+    row0_blobs, row1_blobs, _outliers = _split_rows_robust(cluster, debug=debug)
 
     # Adaptive splitting logic
     widths = sorted([b['bbox_w'] for b in cluster])
@@ -143,6 +263,9 @@ def fit_grid_to_cluster(cluster: List[Dict], binary: np.ndarray,
     bridge_thresh = ref_w * 1.4
 
     def process_row(blobs):
+        """Same bridge-split + erode-classify as before, but DOES NOT cap to
+        GRID_COLS at the end. The outlier-rejection layer below picks the
+        best 5 out of however many survive."""
         res = []
         for b in blobs:
             if b['bbox_w'] > bridge_thresh:
@@ -151,7 +274,6 @@ def fit_grid_to_cluster(cluster: List[Dict], binary: np.ndarray,
                 for p in range(n):
                     x_start = int(b['x_min'] + p * pw)
                     x_end = int(b['x_min'] + (p+1) * pw)
-                    # Crop and measure height on eroded image
                     crop = eroded[b['y_min']:b['y_max'], x_start:x_end]
                     ys, _ = np.where(crop == 255)
                     if len(ys) > 0:
@@ -165,17 +287,53 @@ def fit_grid_to_cluster(cluster: List[Dict], binary: np.ndarray,
                             'x_min': x_start, 'x_max': x_end
                         })
             else:
-                # Measure on eroded image for shape classification
                 crop = eroded[b['y_min']:b['y_max'], b['x_min']:b['x_max']]
                 ys, _ = np.where(crop == 255)
                 if len(ys) > 0:
                     b['area'] = len(ys)
                     b['bbox_h'] = ys.max() - ys.min()
                     res.append(b)
-        return sorted(res, key=lambda x: x['centroid_x'])[:GRID_COLS]
+        return sorted(res, key=lambda x: x['centroid_x'])
 
-    r0 = process_row(row0_blobs)
-    r1 = process_row(row1_blobs)
+    r0_proc = process_row(row0_blobs)
+    r1_proc = process_row(row1_blobs)
+
+    # Refuse to even try if either row is hopelessly over the tolerance
+    # (more than GRID_COLS + MAX_EXTRA_PER_ROW). At that point the cluster
+    # is genuinely noisy, not "marker + scratch".
+    if (len(r0_proc) > GRID_COLS + MAX_EXTRA_PER_ROW or
+            len(r1_proc) > GRID_COLS + MAX_EXTRA_PER_ROW):
+        if debug:
+            print(f"  Too many blobs after row-split (r0={len(r0_proc)}, "
+                  f"r1={len(r1_proc)}) — refusing to guess")
+        return None
+
+    # Outlier rejection: prefer cross-row X-template; fall back to uniformity.
+    if len(r0_proc) == GRID_COLS and len(r1_proc) > GRID_COLS:
+        r0 = r0_proc
+        r1 = _select_5_by_template(r1_proc, [b['centroid_x'] for b in r0])
+        if debug:
+            print(f"  Outlier reject: r1 {len(r1_proc)}→5 via r0 template")
+    elif len(r1_proc) == GRID_COLS and len(r0_proc) > GRID_COLS:
+        r1 = r1_proc
+        r0 = _select_5_by_template(r0_proc, [b['centroid_x'] for b in r1])
+        if debug:
+            print(f"  Outlier reject: r0 {len(r0_proc)}→5 via r1 template")
+    elif len(r0_proc) > GRID_COLS and len(r1_proc) > GRID_COLS:
+        # Both over: uniformity-rank each, then cross-validate r1 against r0.
+        r0 = _select_5_by_uniformity(r0_proc)
+        r1_uni = _select_5_by_uniformity(r1_proc)
+        if r0 and r1_uni:
+            r1 = _select_5_by_template(r1_proc, [b['centroid_x'] for b in r0])
+        else:
+            r1 = r1_uni
+        if debug:
+            print(f"  Outlier reject (both): r0 {len(r0_proc)}→5, "
+                  f"r1 {len(r1_proc)}→5 by uniformity+template")
+    else:
+        r0 = r0_proc
+        r1 = r1_proc
+
     if len(r0) < GRID_COLS or len(r1) < GRID_COLS: return None
 
     # Adaptive classification: Shape = Lower Aspect + Higher Area
