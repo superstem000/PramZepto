@@ -115,57 +115,125 @@ def load_orientation(config) -> str:
 # Orientation analysis
 # ═══════════════════════════════════════════════════════════════
 
-def _compute_trend(values: List[float]) -> Tuple[float, float]:
-    n = len(values)
-    if n < 3:
+def _scan_metrics(ids: List[int]) -> Tuple[float, float]:
+    """Return (sign_agreement, change_rate) for a sequence of integer IDs.
+
+      sign_agreement — among NON-ZERO consecutive deltas, the fraction that
+                       share the dominant sign. 1.0 = monotonic, 0.5 = pure
+                       noise. Robust against occasional jumps caused by
+                       marker hops or skipped frames.
+      change_rate    — fraction of consecutive deltas that are non-zero.
+                       High = axis is "marching"; low = axis is "flat".
+
+    Both metrics live in [0, 1], are bias-free across orientations (BITREV5
+    doesn't inflate either of them artificially), and tolerate sparse data.
+    """
+    arr = [v for v in ids if v is not None]
+    if len(arr) < 2:
         return 0.0, 0.0
-    x = np.arange(n, dtype=float)
-    y = np.array(values, dtype=float)
-    mask = ~np.isnan(y)
-    if mask.sum() < 3:
+    arr = np.asarray(arr, dtype=float)
+    deltas = np.diff(arr)
+    nonzero = deltas[deltas != 0]
+    change_rate = float(len(nonzero)) / float(len(deltas))
+    if len(nonzero) == 0:
         return 0.0, 0.0
-    x, y = x[mask], y[mask]
-    xm, ym = x.mean(), y.mean()
-    ssxx = ((x - xm) ** 2).sum()
-    ssyy = ((y - ym) ** 2).sum()
-    ssxy = ((x - xm) * (y - ym)).sum()
-    if ssxx < 1e-10 or ssyy < 1e-10:
-        return 0.0, 0.0
-    return float(ssxy / ssxx), float((ssxy ** 2) / (ssxx * ssyy))
+    pos = int((nonzero > 0).sum())
+    neg = int((nonzero < 0).sum())
+    sign_agreement = float(max(pos, neg)) / float(len(nonzero))
+    return sign_agreement, change_rate
+
+
+def _apply_orientation(col_id: int, row_id: int, orientation: str) -> Tuple[int, int]:
+    """Mirror of correct_marker_ids() but for a single (col,row) tuple. Kept
+    local so the scoring code stays self-contained."""
+    if orientation == "normal":
+        return col_id, row_id
+    if orientation == "h_flip":
+        return _BITREV5[col_id], _BITREV5[row_id]
+    if orientation == "v_flip":
+        return row_id, col_id
+    if orientation == "180":
+        return _BITREV5[row_id], _BITREV5[col_id]
+    return col_id, row_id
+
+
+def _orientation_score(row_scan_data: List[Dict], col_scan_data: List[Dict],
+                       orientation: str) -> Tuple[float, Dict[str, float]]:
+    """Score how well a candidate orientation explains the row+col scan data.
+
+    For the right orientation:
+      - During the row scan (motor moves in Y), the CORRECTED row_id should
+        march in one direction (high sign_agreement, high change_rate) and
+        the col_id should stay mostly flat (low change_rate).
+      - During the col scan (motor moves in X), col_id marches, row_id flat.
+
+    Score is the sum of four [0, 1] components — march quality for the two
+    expected-marching axes, plus "flatness" (1 - change_rate) for the two
+    expected-flat axes. Max possible = 4.0.
+    """
+    row_cols, row_rows = [], []
+    for d in row_scan_data:
+        if d is None:
+            continue
+        c, r = _apply_orientation(d['col_id'], d['row_id'], orientation)
+        row_cols.append(c)
+        row_rows.append(r)
+    col_cols, col_rows = [], []
+    for d in col_scan_data:
+        if d is None:
+            continue
+        c, r = _apply_orientation(d['col_id'], d['row_id'], orientation)
+        col_cols.append(c)
+        col_rows.append(r)
+
+    rr_agree, rr_rate = _scan_metrics(row_rows)   # expect: marching
+    rc_agree, rc_rate = _scan_metrics(row_cols)   # expect: flat
+    cc_agree, cc_rate = _scan_metrics(col_cols)   # expect: marching
+    cr_agree, cr_rate = _scan_metrics(col_rows)   # expect: flat
+
+    # March quality = agreement × rate. Sign-agreement keeps BITREV5 from
+    # winning on raw magnitude (its deltas alternate sign, dragging agreement
+    # below the monotonic case).
+    row_march = rr_agree * rr_rate
+    col_march = cc_agree * cc_rate
+    row_flat  = 1.0 - rc_rate
+    col_flat  = 1.0 - cr_rate
+
+    parts = {
+        'row_march': row_march, 'col_march': col_march,
+        'row_flat':  row_flat,  'col_flat':  col_flat,
+        'rr_agree':  rr_agree,  'rr_rate':   rr_rate,
+        'cc_agree':  cc_agree,  'cc_rate':   cc_rate,
+        'rc_rate':   rc_rate,   'cr_rate':   cr_rate,
+    }
+    return row_march + col_march + row_flat + col_flat, parts
 
 
 def analyze_orientation(row_scan_data: List[Dict], col_scan_data: List[Dict]) -> str:
-    row_col_ids = [d['col_id'] for d in row_scan_data if d is not None]
-    row_row_ids = [d['row_id'] for d in row_scan_data if d is not None]
-    col_col_ids = [d['col_id'] for d in col_scan_data if d is not None]
-    col_row_ids = [d['row_id'] for d in col_scan_data if d is not None]
+    """Choose the orientation (normal / h_flip / v_flip / 180) that best
+    explains the row+col scan data. Replaces the old R²-gated decision tree,
+    which silently fell into the '180' bucket whenever R² < 0.7 — and R²
+    drops fast under sparse markers / marker hops / detection noise.
 
-    rc_slope, rc_r2 = _compute_trend(row_col_ids)
-    rr_slope, rr_r2 = _compute_trend(row_row_ids)
-    cc_slope, cc_r2 = _compute_trend(col_col_ids)
-    cr_slope, cr_r2 = _compute_trend(col_row_ids)
+    The new scoring is bias-free across orientations (no BITREV5 magnitude
+    inflation), tolerates skipped frames, and degrades gracefully when only
+    a few clean frames are available."""
+    scores = {}
+    for ori in ORIENTATIONS:
+        s, parts = _orientation_score(row_scan_data, col_scan_data, ori)
+        scores[ori] = (s, parts)
+        print(f"[Orient] {ori:>7s}: score={s:.3f} "
+              f"(row_march={parts['row_march']:.2f} col_march={parts['col_march']:.2f} "
+              f"row_flat={parts['row_flat']:.2f} col_flat={parts['col_flat']:.2f})")
 
-    print(f"[Orient] Row-scan: col_id slope={rc_slope:.3f} R²={rc_r2:.3f}, "
-          f"row_id slope={rr_slope:.3f} R²={rr_r2:.3f}")
-    print(f"[Orient] Col-scan: col_id slope={cc_slope:.3f} R²={cc_r2:.3f}, "
-          f"row_id slope={cr_slope:.3f} R²={cr_r2:.3f}")
-
-    axes_correct = (abs(rr_slope) > abs(rc_slope)) and (abs(cc_slope) > abs(cr_slope))
-    row_smooth = (rr_r2 if abs(rr_slope) > abs(rc_slope) else rc_r2) > 0.7
-    col_smooth = (cc_r2 if abs(cc_slope) > abs(cr_slope) else cr_r2) > 0.7
-    is_smooth = row_smooth and col_smooth
-
-    if axes_correct and is_smooth:
-        result = "normal"
-    elif axes_correct and not is_smooth:
-        result = "h_flip"
-    elif not axes_correct and is_smooth:
-        result = "v_flip"
-    else:
-        result = "180"
-
-    print(f"[Orient] axes_correct={axes_correct}, smooth={is_smooth} → {result}")
-    return result
+    best = max(scores, key=lambda o: scores[o][0])
+    best_score = scores[best][0]
+    # Margin = how decisively the winner beat the runner-up. Helps the user
+    # diagnose ambiguous calibrations from the log without aborting.
+    runner_up = max((s for o, (s, _) in scores.items() if o != best), default=0.0)
+    margin = best_score - runner_up
+    print(f"[Orient] → {best} (margin over runner-up: {margin:+.3f})")
+    return best
 
 
 # ═══════════════════════════════════════════════════════════════
