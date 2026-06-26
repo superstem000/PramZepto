@@ -150,6 +150,14 @@ class FreeModeScreen(QWidget):
         self._camera_controls.set_live_state(False)
 
     def _on_capture(self):
+        # The shared stepper widget broadcasts button signals to BOTH screens
+        # (free_mode + record_setup) regardless of which is on top. Guard
+        # against this handler firing while the other screen is visible —
+        # otherwise our camera_preview (idle) raises a spurious "Start
+        # live preview" warning even though the user is operating on the
+        # other screen where preview is on.
+        if not self.isVisible():
+            return
         if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning", "Start live preview before capturing.")
             return
@@ -190,6 +198,8 @@ class FreeModeScreen(QWidget):
 
     def _on_af_requested(self):
         """Handle Auto Focus button press."""
+        if not self.isVisible():
+            return
         if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning",
                                 "Start live preview before autofocusing.")
@@ -267,6 +277,8 @@ class FreeModeScreen(QWidget):
 
     def _on_cal_requested(self):
         """Handle Calibrate Stage button press — runs orientation + calibration."""
+        if not self.isVisible():
+            return
         if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning",
                                 "Start live preview before calibrating.")
@@ -290,11 +302,15 @@ class FreeModeScreen(QWidget):
 
     def _on_cal_stop_requested(self):
         """Handle Calibrate Stage stop request."""
+        if not self.isVisible():
+            return
         if self._orient_cal.is_active():
             self._orient_cal.stop("Stopped by user")
 
     def _on_move_to_feature_requested(self, col: int, row: int):
         """Handle Move to Feature request — triggers detection preview first."""
+        if not self.isVisible():
+            return
         if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning",
                                 "Start live preview before moving to feature.")
@@ -383,6 +399,8 @@ class FreeModeScreen(QWidget):
 
     def _on_spiral_scan_requested(self):
         """Handle Spiral Scan button press."""
+        if not self.isVisible():
+            return
         if not self.camera_preview.is_running():
             QMessageBox.warning(self, "Warning",
                                 "Start live preview before scanning.")
@@ -398,6 +416,8 @@ class FreeModeScreen(QWidget):
 
     def _on_spiral_scan_stop(self):
         """Handle Spiral Scan stop request."""
+        if not self.isVisible():
+            return
         if self._spiral_scan.is_active():
             self._spiral_scan.stop("Stopped by user")
     
