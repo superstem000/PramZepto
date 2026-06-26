@@ -1022,9 +1022,11 @@ class SpiralScanController(QObject):
         """Single funnel for every failure that escalates AF range. Each call
         is one range-increasing restart; capped per-context:
           - spiral acquisition: MAX_LOCALIZE_RETRIES → _skip_dead_tile()
-          - walk phase:         MAX_WALK_RETRIES    → halt (no in-walk skip
-                                target exists; aborting is safer than
-                                blind-moving to an unconfirmed tile)"""
+          - walk phase:         MAX_WALK_RETRIES    → give up on precise
+                                target, fire walk's _walk_final_cb so the
+                                next phase proceeds from current position.
+        Outer guard MAX_CONSECUTIVE_SKIPS halts the run only when many
+        consecutive tile skips suggest systemic detection failure."""
         if self._stop_requested:
             return
         self._pending_z_sample = None  # this tile was never confirmed

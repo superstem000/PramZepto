@@ -878,8 +878,18 @@ class OrientCalibrationController(QObject):
             self.stop("Calibration failed: could not measure grid pitch")
             return
 
-        self.result.grid_pitch_col_fs = -col_pitch_fs
-        self.result.grid_pitch_row_fs = -row_pitch_fs
+        # Convention (matches stage_calibration's storage and spiral_scan's
+        # move math): grid_pitch_*_fs is the raw within-frame pitch in motor
+        # units — "px shift per +1 col_id step in the printed grid", run
+        # through px_to_motor. spiral_scan applies its own −grid_dpx in the
+        # final motor_delta = px_to_motor @ (−grid_dpx) so the right-hand
+        # sign here is positive. The previous −col_pitch_fs negation made
+        # orient_cal disagree with stage_cal on sign convention, which made
+        # every spiral move travel in the opposite direction once orientation
+        # was determined to be "normal" (under "180" the BITREV5+swap
+        # accidentally compensated).
+        self.result.grid_pitch_col_fs = col_pitch_fs
+        self.result.grid_pitch_row_fs = row_pitch_fs
         self.result.grid_pitch_col_px = self.result.motor_to_px @ self.result.grid_pitch_col_fs
         self.result.grid_pitch_row_px = self.result.motor_to_px @ self.result.grid_pitch_row_fs
 
