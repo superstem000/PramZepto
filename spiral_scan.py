@@ -1040,8 +1040,21 @@ class SpiralScanController(QObject):
         elif self._in_walk:
             self._walk_retries += 1
             if self._walk_retries >= self.MAX_WALK_RETRIES:
-                self.stop(f"Walk: {self._walk_retries} detection-failure retries "
-                          f"exceeded — halting (cannot localise during walk)")
+                # Spec: don't halt — give up on reaching the exact walk target
+                # and proceed with whatever was supposed to come next from the
+                # current physical position. The next phase (e.g. spiral
+                # acquisition) will infer / skip individual tiles using its
+                # own cap machinery; this matches the "skip the position, go
+                # to the next" rule the user asked for everywhere.
+                print(f"[DemoScan] Walk: {self._walk_retries} retries — "
+                      f"giving up on precise target ({self._walk_target_col},"
+                      f"{self._walk_target_row}), proceeding from current position")
+                self._walk_retries = 0
+                self._in_walk = False
+                cb = self._walk_final_cb
+                self._walk_final_cb = None
+                if cb:
+                    QTimer.singleShot(10, cb)
                 return
         self._state = 'sanity_af'
         self._after_move_cb = retry_cb
@@ -1393,8 +1406,17 @@ class SpiralScanController(QObject):
         # No markers (or none survived filtering): cap-bounded detection-fail loop.
         self._walk_retries += 1
         if self._walk_retries >= self.MAX_WALK_RETRIES:
-            self.stop(f"Walk: {self._walk_retries} detection-failure retries "
-                      f"during _walk_check — halting")
+            # Same skip-and-continue policy as the _on_localize_fail path.
+            print(f"[DemoScan] Walk: {self._walk_retries} retries during "
+                  f"_walk_check — giving up on precise target ("
+                  f"{self._walk_target_col},{self._walk_target_row}), "
+                  f"proceeding from current position")
+            self._walk_retries = 0
+            self._in_walk = False
+            cb = self._walk_final_cb
+            self._walk_final_cb = None
+            if cb:
+                QTimer.singleShot(10, cb)
             return
         # Not there yet — AF then continue
         self._state = 'walk_af'
