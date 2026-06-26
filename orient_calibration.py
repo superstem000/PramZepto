@@ -804,27 +804,75 @@ class OrientCalibrationController(QObject):
             self.stop("Calibration failed: could not compute motor-to-pixel matrix")
             return
 
-        # Step 4: Compute grid pitch from boundary crossings across scan frames
-        row_pitch_fs = self._measure_pitch_from_crossings(
-            self._row_scan_frames, self._row_motor_deltas, 'row')
-        col_pitch_fs = self._measure_pitch_from_crossings(
-            self._col_scan_frames, self._col_motor_deltas, 'col')
+        # ── Step 4: Grid pitch ────────────────────────────────────────
+        # Within-frame measurement is the PRIMARY source — it uses only
+        # axis-aligned marker pairs within a single frame, so each sample is
+        # a direct geometric observation that can't blow up due to a noisy
+        # ID delta. Crossings is only used as a fallback for scan regions
+        # where every frame has <2 markers.
+        #
+        # The previous order (crossings first, within-frame as fallback) lets
+        # a wrong-orientation crossings result write a physically-impossible
+        # pitch even when within-frame data was available — that's how the
+        # user ended up with 4340-px column pitch in a 4056-px-wide image.
 
-        # Also try within-frame measurement as backup
-        if col_pitch_fs is None or row_pitch_fs is None:
-            for frame_data in self._row_scan_frames + self._col_scan_frames:
-                if len(frame_data['markers']) >= 2:
-                    cp, rp = measure_pixel_pitch_from_markers(frame_data['markers'])
-                    if cp is not None and col_pitch_fs is None:
-                        col_pitch_fs = self.result.px_to_motor @ cp
-                        print(f"[OrientCal] Col pitch from within-frame: "
-                              f"({col_pitch_fs[0]:.2f}, {col_pitch_fs[1]:.2f})fs")
-                    if rp is not None and row_pitch_fs is None:
-                        row_pitch_fs = self.result.px_to_motor @ rp
-                        print(f"[OrientCal] Row pitch from within-frame: "
-                              f"({row_pitch_fs[0]:.2f}, {row_pitch_fs[1]:.2f})fs")
-                    if col_pitch_fs is not None and row_pitch_fs is not None:
-                        break
+        # Try within-frame first across every collected scan frame; average
+        # all valid samples to be robust to single-frame anomalies.
+        col_px_samples, row_px_samples = [], []
+        for frame_data in self._row_scan_frames + self._col_scan_frames:
+            if len(frame_data['markers']) >= 2:
+                cp, rp = measure_pixel_pitch_from_markers(frame_data['markers'])
+                if cp is not None:
+                    col_px_samples.append(cp)
+                if rp is not None:
+                    row_px_samples.append(rp)
+
+        col_pitch_fs = row_pitch_fs = None
+        if col_px_samples:
+            col_pitch_px_mean = np.mean(np.stack(col_px_samples), axis=0)
+            col_pitch_fs = self.result.px_to_motor @ col_pitch_px_mean
+            print(f"[OrientCal] Col pitch from {len(col_px_samples)} within-frame "
+                  f"samples: ({col_pitch_fs[0]:.2f}, {col_pitch_fs[1]:.2f})fs "
+                  f"px=({col_pitch_px_mean[0]:.1f}, {col_pitch_px_mean[1]:.1f})")
+        if row_px_samples:
+            row_pitch_px_mean = np.mean(np.stack(row_px_samples), axis=0)
+            row_pitch_fs = self.result.px_to_motor @ row_pitch_px_mean
+            print(f"[OrientCal] Row pitch from {len(row_px_samples)} within-frame "
+                  f"samples: ({row_pitch_fs[0]:.2f}, {row_pitch_fs[1]:.2f})fs "
+                  f"px=({row_pitch_px_mean[0]:.1f}, {row_pitch_px_mean[1]:.1f})")
+
+        # Crossings fallback for axes that within-frame couldn't measure
+        if col_pitch_fs is None:
+            col_pitch_fs = self._measure_pitch_from_crossings(
+                self._col_scan_frames, self._col_motor_deltas, 'col')
+        if row_pitch_fs is None:
+            row_pitch_fs = self._measure_pitch_from_crossings(
+                self._row_scan_frames, self._row_motor_deltas, 'row')
+
+        # Sanity check whichever source produced each pitch. A pitch whose
+        # pixel magnitude exceeds the image diagonal can't correspond to
+        # adjacent tiles in this FOV — that's a math failure, not a real
+        # measurement. Drop it back to None so the next-tier source can try.
+        h_px = (self.result.image_center_y or 1520.0) * 2.0
+        w_px = (self.result.image_center_x or 2028.0) * 2.0
+        img_diag_px = float(np.hypot(w_px, h_px))
+
+        def _is_pitch_sane(pitch_fs: Optional[np.ndarray], label: str) -> bool:
+            if pitch_fs is None:
+                return False
+            pitch_px = self.result.motor_to_px @ pitch_fs
+            mag = float(np.linalg.norm(pitch_px))
+            if mag > img_diag_px:
+                print(f"[OrientCal] REJECT {label} pitch — px-magnitude "
+                      f"{mag:.0f} > image diagonal {img_diag_px:.0f} "
+                      f"(physically impossible for adjacent tiles)")
+                return False
+            return True
+
+        if not _is_pitch_sane(col_pitch_fs, 'col'):
+            col_pitch_fs = None
+        if not _is_pitch_sane(row_pitch_fs, 'row'):
+            row_pitch_fs = None
 
         if col_pitch_fs is None or row_pitch_fs is None:
             self.stop("Calibration failed: could not measure grid pitch")
