@@ -551,6 +551,15 @@ class MovePlannerWidget(QWidget):
     # Add steps
     # =========================
 
+    def _cur_x_fs(self) -> float:
+        return float(getattr(self.stepper.MOTORS, "x_current_position_full_step", 0.0))
+
+    def _cur_y_fs(self) -> float:
+        return float(getattr(self.stepper.MOTORS, "y_current_position_full_step", 0.0))
+
+    def _cur_z_fs(self) -> float:
+        return float(getattr(self.stepper.MOTORS, "z_current_position_full_step", 0.0))
+
     def _on_use_current(self):
         try:
             x_fs = float(getattr(self.stepper.MOTORS, "x_current_position_full_step", 0.0))
@@ -1044,6 +1053,13 @@ class MovePlannerWidget(QWidget):
         step = steps[self._exec_index]
         self.table.selectRow(self._exec_index)
 
+        print(f"[TRACE-CAL] _advance_exec_step idx={self._exec_index} "
+              f"step_type={step.step_type!r} "
+              f"cal_prep_moving={self._cal_prep_moving} "
+              f"cal_skip_move_to_center={self._cal_skip_move_to_center} "
+              f"cal_running_for_step={self._cal_running_for_step} "
+              f"micro_seq_index={self._micro_seq_index}")
+
         if step.step_type == "move":
             self._execute_move_step(step)
         elif step.step_type == "microfluidics":
@@ -1087,6 +1103,10 @@ class MovePlannerWidget(QWidget):
             self._set_status(
                 f"Step {self._exec_index + 1}: Moving to calibration center..."
             )
+            print(f"[TRACE-CAL] calibration step: driving pre-move to "
+                  f"SAFE_CENTER=({SAFE_CENTER_X_FS}, {SAFE_CENTER_Y_FS}, 0.0). "
+                  f"cur=({self._cur_x_fs():.1f}, {self._cur_y_fs():.1f}, "
+                  f"{self._cur_z_fs():.1f})")
             try:
                 self.stepper._preempt_all_motion()
                 self.stepper._all_btn_enabled(False)
@@ -1095,6 +1115,7 @@ class MovePlannerWidget(QWidget):
                 )
             except Exception as e:
                 self._cal_prep_moving = False
+                print(f"[TRACE-CAL] calibration pre-move exception: {e}")
                 self._finish_execution(f"Move to cal center failed: {e}")
         elif step.step_type == "spiral_scan":
             self._pending_dwell_ms = step.dwell_ms
@@ -1384,6 +1405,16 @@ class MovePlannerWidget(QWidget):
     # =========================
 
     def _on_move_to_finished(self, success: bool, message: str):
+        print(f"[TRACE-CAL] _on_move_to_finished success={success} msg={message!r} "
+              f"pos=({self._cur_x_fs():.1f}, {self._cur_y_fs():.1f}, "
+              f"{self._cur_z_fs():.1f}) "
+              f"exec_active={self._exec_active} "
+              f"dwell_active={self._dwell_timer.isActive()} "
+              f"waiting_for_cal={self._waiting_for_cal} "
+              f"cal_running_for_step={self._cal_running_for_step} "
+              f"spiral_running={self._spiral_scan_running_for_step} "
+              f"cal_prep_moving={self._cal_prep_moving} "
+              f"micro_seq_index={self._micro_seq_index}")
         if not self._exec_active:
             return
 
@@ -1393,6 +1424,8 @@ class MovePlannerWidget(QWidget):
         # signal is in charge of advancing — not move_to_ctrl.
         if self._dwell_timer.isActive() or self._waiting_for_cal \
                 or self._cal_running_for_step:
+            print(f"[TRACE-CAL] _on_move_to_finished: BAIL "
+                  f"(dwell/waiting/cal-running guard)")
             return
 
         # Same idea for an active spiral scan: it issues its own moves.
@@ -1415,6 +1448,10 @@ class MovePlannerWidget(QWidget):
         # Hand off to the working cal-during-dwell path but tell OrientCal
         # to skip its own move-to-center (we already drove there).
         if self._cal_prep_moving:
+            print(f"[TRACE-CAL] _on_move_to_finished: pre-move to SAFE_CENTER "
+                  f"complete. pos=({self._cur_x_fs():.1f}, "
+                  f"{self._cur_y_fs():.1f}, {self._cur_z_fs():.1f}). "
+                  f"Handing off to dwell-with-cal (skip_move_to_center=True).")
             self._cal_prep_moving = False
             self._pending_dwell_ms = 0
             self._pending_cal_during_dwell = True
@@ -1460,6 +1497,10 @@ class MovePlannerWidget(QWidget):
 
     def _kick_off_calibration_during_dwell(self):
         """Start orientation calibration in parallel with the dwell."""
+        print(f"[TRACE-CAL] _kick_off_calibration_during_dwell entered. "
+              f"orient_cal={self._orient_cal is not None} "
+              f"orient_cal_active={self._orient_cal.is_active() if self._orient_cal else False} "
+              f"cal_skip_move_to_center={self._cal_skip_move_to_center}")
         if self._orient_cal is None:
             print("[Planner] run_calibration_during_dwell requested but no "
                   "orient_cal controller wired up — skipping cal, dwell continues.")
@@ -1519,6 +1560,10 @@ class MovePlannerWidget(QWidget):
         # move-to-center and go straight to AF. Cleared after use.
         skip = getattr(self, '_cal_skip_move_to_center', False)
         self._cal_skip_move_to_center = False
+        print(f"[TRACE-CAL] _deferred_cal_start firing. "
+              f"skip_move_to_center={skip} "
+              f"pos=({self._cur_x_fs():.1f}, {self._cur_y_fs():.1f}, "
+              f"{self._cur_z_fs():.1f})")
         try:
             self._orient_cal.start(settings, skip_move_to_center=skip)
             print(f"[Planner] Orientation calibration started "

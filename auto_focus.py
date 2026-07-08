@@ -353,9 +353,10 @@ class AutoFocusController(QObject):
         the module-level KNOWN_FOCUS_FULLSTEP is updated so subsequent
         regular AF runs use it as their center.
         """
-        print(f"[AF] start_calibration_af called")
-        print(f"[AF] start_calibration_af id={id(self)} active={self._active}")
+        print(f"[TRACE-CAL] AF.start_calibration_af called active={self._active} "
+              f"z_cur={float(getattr(self.MOTORS, 'z_current_position_full_step', 0.0)):.2f}")
         if self._active:
+            print(f"[TRACE-CAL] AF.start_calibration_af BAIL: already active")
             return
         if not self.camera_preview.is_running():
             self.finished.emit(False, "Start live preview before autofocusing.")

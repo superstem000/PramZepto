@@ -408,9 +408,14 @@ class OrientCalibrationController(QObject):
         move_to_ctrl.finished coupling for the setup phase, so no race
         can prematurely trigger AF.
         """
+        print(f"[TRACE-CAL] OrientCal.start(skip_move_to_center={skip_move_to_center}) "
+              f"active={self._active} phase={self._phase} "
+              f"pos=({self._cur_x():.1f}, {self._cur_y():.1f}, {self._cur_z():.1f})")
         if self._active:
+            print(f"[TRACE-CAL] OrientCal.start: BAIL, already active")
             return
         if not self.camera_preview.is_running():
+            print(f"[TRACE-CAL] OrientCal.start: BAIL, camera preview not running")
             self.finished.emit(False, "Start live preview first.", None)
             return
 
@@ -438,9 +443,14 @@ class OrientCalibrationController(QObject):
         # checks it as an idempotency guard.
         self._phase = 'move_to_center'
         if skip_move_to_center:
+            print(f"[TRACE-CAL] OrientCal.start: SKIP path — scheduling "
+                  f"_start_autofocus in {SETTLE_MS}ms, NOT calling "
+                  f"move_to_ctrl.start")
             self.progress.emit('setup', 'Starting calibration AF (already at center)...')
             QTimer.singleShot(SETTLE_MS, self._start_autofocus)
         else:
+            print(f"[TRACE-CAL] OrientCal.start: NORMAL path — calling "
+                  f"move_to_ctrl.start(SAFE_CENTER)")
             self.progress.emit('setup', 'Moving to safe region center...')
             self.move_to_ctrl.start(SAFE_CENTER_X_FS, SAFE_CENTER_Y_FS, 0.0)
 
@@ -541,6 +551,9 @@ class OrientCalibrationController(QObject):
     # ═══════════════════════════════════════════════════════════════
 
     def _start_autofocus(self):
+        print(f"[TRACE-CAL] _start_autofocus entered. phase={self._phase} "
+              f"stop_requested={self._stop_requested} active={self._active} "
+              f"pos=({self._cur_x():.1f}, {self._cur_y():.1f}, {self._cur_z():.1f})")
         if self._stop_requested:
             return
         # Idempotency guard: this is only ever scheduled from the
@@ -1540,7 +1553,10 @@ class OrientCalibrationController(QObject):
     # ═══════════════════════════════════════════════════════════════
 
     def _on_move_finished(self, success, message):
-        print(f"[OrientCal id={id(self)}] _on_move_finished success={success} active={self._active} phase={self._phase}")
+        print(f"[TRACE-CAL] OrientCal._on_move_finished success={success} "
+              f"msg={message!r} active={self._active} phase={self._phase} "
+              f"af_kickoff_pending={self._af_kickoff_pending} "
+              f"pos=({self._cur_x():.1f}, {self._cur_y():.1f}, {self._cur_z():.1f})")
         if not self._active or self._phase == 'idle':
             return
         if self._phase in ('z_spiral_scan', 'refine_spiral_scan'):

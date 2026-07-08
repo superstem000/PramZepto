@@ -80,8 +80,13 @@ class StepperMotorsMoveto(QObject):
         Pure Z to ~0: home Z.
         Pure Z to other: move directly.
         """
-        print(f"[MoveTo id={id(self)}] start({tx_fs:.1f}, {ty_fs:.1f}, {tz_fs:.1f}) _active={self._active}")
+        cur = self._cur()
+        print(f"[TRACE-CAL] MoveTo.start target=({tx_fs:.1f}, {ty_fs:.1f}, "
+              f"{tz_fs:.1f}) cur=({cur['x']:.1f}, {cur['y']:.1f}, "
+              f"{cur['z']:.1f}) _active={self._active}")
         if self._active:
+            print(f"[TRACE-CAL] MoveTo.start BAIL: already active, emitting "
+                  f"finished(False)")
             self.finished.emit(False, "Busy: move-to already active.")
             return
 
@@ -184,9 +189,15 @@ class StepperMotorsMoveto(QObject):
             self._z_home_connected = False
 
     def _on_z_home_done(self, success: bool, message: str):
+        cur = self._cur()
+        print(f"[TRACE-CAL] MoveTo._on_z_home_done success={success} "
+              f"active={self._active} phase={self._phase} "
+              f"cur=({cur['x']:.1f}, {cur['y']:.1f}, {cur['z']:.1f})")
         self._disconnect_z_home_signal()
 
         if not self._active or self._phase != "z_homing":
+            print(f"[TRACE-CAL] MoveTo._on_z_home_done BAIL "
+                  f"(active={self._active} phase={self._phase})")
             return
 
         if not success:
@@ -246,13 +257,23 @@ class StepperMotorsMoveto(QObject):
         self.motion.stop_immediate()
         self._restore_profile()
         self.statusChanged.emit("Idle", "gray")
-        print(f"[MoveTo] emit finished (real)")
+        cur = self._cur()
+        print(f"[TRACE-CAL] MoveTo._finish emitting finished(True) "
+              f"cur=({cur['x']:.1f}, {cur['y']:.1f}, {cur['z']:.1f}) "
+              f"final_target=({self._final_target['x']:.1f}, "
+              f"{self._final_target['y']:.1f}, "
+              f"{self._final_target['z']:.1f})")
         self.finished.emit(True, "")
 
     def _advance_phase(self):
         """Transition to the next phase after arriving at current target."""
         cur = self._cur()
         now = time.monotonic()
+        print(f"[TRACE-CAL] MoveTo._advance_phase from phase={self._phase} "
+              f"cur=({cur['x']:.1f}, {cur['y']:.1f}, {cur['z']:.1f}) "
+              f"final_target=({self._final_target['x']:.1f}, "
+              f"{self._final_target['y']:.1f}, "
+              f"{self._final_target['z']:.1f})")
 
         if self._phase == "z_up":
             # Z retract done (fallback path) → now do XY
