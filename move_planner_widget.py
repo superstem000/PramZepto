@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
 )
 
 from widget_collapsible_box import CollapsibleBox
+from orient_calibration import SAFE_CENTER_X_FS, SAFE_CENTER_Y_FS
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -180,6 +181,8 @@ class MovePlannerWidget(QWidget):
         self._camera_settings_provider = None
         self._cal_running_for_step = False  # we kicked off cal for this dwell
         self._waiting_for_cal = False       # dwell expired, holding for cal
+        self._cal_prep_moving = False       # planner-driven move to SAFE_CENTER before cal
+        self._cal_skip_move_to_center = False  # passed to orient_cal.start()
 
         # Spiral-scan-step hooks. The host screen calls
         # set_spiral_scan_controller() and set_spiral_scan_settings_provider()
@@ -1000,6 +1003,8 @@ class MovePlannerWidget(QWidget):
         self._exec_index = -1
         self._micro_seq_index = -1
         self._micro_seq_source = []
+        self._cal_prep_moving = False
+        self._cal_skip_move_to_center = False
         # Stop any running cal we kicked off during a dwell
         self._cleanup_cal_during_dwell(stop_cal=True)
         # Stop any running spiral scan we kicked off
@@ -1064,16 +1069,33 @@ class MovePlannerWidget(QWidget):
             self._set_status(f"Step {self._exec_index + 1}: µFluidics Push 2...")
             self._advance_microfluidics()
         elif step.step_type == "calibration":
-            # Reuse the working cal-during-dwell path: start a 1 ms dwell with
-            # cal-during-dwell=True. The dwell timer expires almost immediately;
-            # if cal is still running (it will be — takes ~30 min), the existing
-            # `_waiting_for_cal` mechanism holds until cal finishes, then
-            # advances the recipe. Same code path as the legacy 1-hour dwell
-            # step; nothing new to race.
+            # First move the stage to SAFE_CENTER as a plain planner-driven
+            # move. When that move finishes cleanly (per the planner's normal
+            # _on_move_to_finished path), we then hand off to the working
+            # dwell-with-cal machinery — but tell OrientCal to SKIP its
+            # internal move-to-center (we already did it) and jump straight
+            # to AF. Decouples the move-completion signal from AF start; no
+            # move_to_ctrl.finished coupling can trigger AF prematurely.
             self._pending_dwell_ms = 0
-            self._pending_cal_during_dwell = True
-            self._set_status(f"Step {self._exec_index + 1}: Calibration (~30 min)...")
-            self._start_dwell(1)
+            self._pending_cal_during_dwell = False
+            self._cal_prep_moving = True
+            self._override_z_limit()
+            try:
+                self.stepper.mc.set_speed_multiplier(1.0)
+            except Exception:
+                pass
+            self._set_status(
+                f"Step {self._exec_index + 1}: Moving to calibration center..."
+            )
+            try:
+                self.stepper._preempt_all_motion()
+                self.stepper._all_btn_enabled(False)
+                self.stepper.move_to_ctrl.start(
+                    SAFE_CENTER_X_FS, SAFE_CENTER_Y_FS, 0.0
+                )
+            except Exception as e:
+                self._cal_prep_moving = False
+                self._finish_execution(f"Move to cal center failed: {e}")
         elif step.step_type == "spiral_scan":
             self._pending_dwell_ms = step.dwell_ms
             self._pending_cal_during_dwell = False
@@ -1383,7 +1405,24 @@ class MovePlannerWidget(QWidget):
                 self.stepper.mc.set_speed_multiplier(self._saved_speed_mult)
             except Exception:
                 pass
+            # If this was the pre-cal move to SAFE_CENTER, clear the flag so
+            # a stray retry can't re-enter cal handoff.
+            self._cal_prep_moving = False
             self._finish_execution(message or "Move failed.")
+            return
+
+        # Standalone-calibration pre-move to SAFE_CENTER just completed.
+        # Hand off to the working cal-during-dwell path but tell OrientCal
+        # to skip its own move-to-center (we already drove there).
+        if self._cal_prep_moving:
+            self._cal_prep_moving = False
+            self._pending_dwell_ms = 0
+            self._pending_cal_during_dwell = True
+            self._cal_skip_move_to_center = True
+            self._set_status(
+                f"Step {self._exec_index + 1}: Calibration (~30 min)..."
+            )
+            self._start_dwell(1)
             return
 
         # If in microfluidics sub-sequence, check dwell then advance
@@ -1475,9 +1514,15 @@ class MovePlannerWidget(QWidget):
             return
         if self._orient_cal is None:
             return
+        # If the planner already drove the stage to SAFE_CENTER (standalone
+        # calibration step), tell OrientCal to skip its internal
+        # move-to-center and go straight to AF. Cleared after use.
+        skip = getattr(self, '_cal_skip_move_to_center', False)
+        self._cal_skip_move_to_center = False
         try:
-            self._orient_cal.start(settings)
-            print("[Planner] Orientation calibration started during dwell.")
+            self._orient_cal.start(settings, skip_move_to_center=skip)
+            print(f"[Planner] Orientation calibration started "
+                  f"(skip_move_to_center={skip}).")
         except Exception as e:
             self._cal_running_for_step = False
             print(f"[Planner] Failed to start calibration during dwell: {e}")
