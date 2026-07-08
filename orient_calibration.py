@@ -399,7 +399,15 @@ class OrientCalibrationController(QObject):
     def is_active(self) -> bool:
         return self._active
 
-    def start(self, camera_settings):
+    def start(self, camera_settings, skip_move_to_center=False):
+        """Start orientation calibration.
+
+        If skip_move_to_center=True, the caller guarantees the stage is
+        already at (SAFE_CENTER_X_FS, SAFE_CENTER_Y_FS, 0). We skip the
+        internal move-to-center entirely and go straight to AF — no
+        move_to_ctrl.finished coupling for the setup phase, so no race
+        can prematurely trigger AF.
+        """
         if self._active:
             return
         if not self.camera_preview.is_running():
@@ -426,10 +434,15 @@ class OrientCalibrationController(QObject):
         except Exception:
             self._saved_speed_mult = 1.0
 
+        # phase='move_to_center' is required either way — _start_autofocus
+        # checks it as an idempotency guard.
         self._phase = 'move_to_center'
-        self.progress.emit('setup', 'Moving to safe region center...')
-        cur_z = float(getattr(self.MOTORS, "z_current_position_full_step", 0.0))
-        self.move_to_ctrl.start(SAFE_CENTER_X_FS, SAFE_CENTER_Y_FS, 0.0)
+        if skip_move_to_center:
+            self.progress.emit('setup', 'Starting calibration AF (already at center)...')
+            QTimer.singleShot(SETTLE_MS, self._start_autofocus)
+        else:
+            self.progress.emit('setup', 'Moving to safe region center...')
+            self.move_to_ctrl.start(SAFE_CENTER_X_FS, SAFE_CENTER_Y_FS, 0.0)
 
     def stop(self, reason="Cancelled"):
         if not self._active:
