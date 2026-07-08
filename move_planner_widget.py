@@ -1005,6 +1005,17 @@ class MovePlannerWidget(QWidget):
         self._cal_step_active = False
         # Stop any running cal we kicked off during a dwell
         self._cleanup_cal_during_dwell(stop_cal=True)
+        # Stop any running standalone-step cal we kicked off
+        if self._orient_cal is not None:
+            try:
+                self._orient_cal.finished.disconnect(self._on_calibration_step_finished)
+            except Exception:
+                pass
+            try:
+                if self._orient_cal.is_active():
+                    self._orient_cal.stop("Recipe stopped")
+            except Exception:
+                pass
         # Stop any running spiral scan we kicked off
         self._cleanup_spiral_scan(stop_scan=True)
         self._restore_z_limit()
@@ -1455,8 +1466,12 @@ class MovePlannerWidget(QWidget):
         # something OTHER than our recipe (e.g. orientation calibration
         # moving the stage during the dwell). The dwell timer / cal-finished
         # signal is in charge of advancing — not move_to_ctrl.
+        # Same for the standalone calibration step (_cal_step_active):
+        # OrientCal issues its own move_to_ctrl moves for move-to-center,
+        # row/col scans, spiral scans, etc.; the calibration's finished
+        # signal is the only thing that should advance the recipe.
         if self._dwell_timer.isActive() or self._waiting_for_cal \
-                or self._cal_running_for_step:
+                or self._cal_running_for_step or self._cal_step_active:
             return
 
         # Same idea for an active spiral scan: it issues its own moves.
