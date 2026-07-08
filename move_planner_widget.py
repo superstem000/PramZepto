@@ -1184,6 +1184,27 @@ class MovePlannerWidget(QWidget):
 
         self._cal_step_active = True
         self._set_status(f"Step {self._exec_index + 1}: Calibration (~30 min)...")
+
+        # Defer to the next event-loop tick. We're reached from inside a
+        # move_to_ctrl.finished emission (the prior step's move completing —
+        # potentially "already at target", which fires `finished` synchronously).
+        # orient_cal.start() synchronously issues its own move_to_ctrl.start()
+        # for move-to-center; doing that here means OrientCal's own
+        # _on_move_finished slot — invoked later in the SAME finished
+        # emission — could mistake the in-flight signal for its move-to-center
+        # completing and kick off the XY move + autofocus prematurely,
+        # racing the still-in-progress motion. Deferring lets the current
+        # emission fully drain (controller still inactive) before cal begins.
+        # See commit d123a7a for the original fix on the dwell path.
+        QTimer.singleShot(0, lambda s=settings: self._deferred_cal_step_start(s))
+
+    def _deferred_cal_step_start(self, settings):
+        """Start orient cal on a clean stack (see _execute_calibration_step).
+        Bail if the recipe was stopped before this fired."""
+        if not self._exec_active or not self._cal_step_active:
+            return
+        if self._orient_cal is None:
+            return
         try:
             self._orient_cal.start(settings)
         except Exception as e:
