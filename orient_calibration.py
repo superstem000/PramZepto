@@ -409,6 +409,7 @@ class OrientCalibrationController(QObject):
         self._active = True
         self._stop_requested = False
         self._af_kickoff_pending = False
+        self._center_arrival_polls = 0
         self._camera_settings = camera_settings
         self._row_scan_data = []
         self._col_scan_data = []
@@ -538,6 +539,33 @@ class OrientCalibrationController(QObject):
             print(f"[OrientCal id={id(self)}] _start_autofocus ignored "
                   f"(phase={self._phase}, not move_to_center)")
             return
+
+        # Position-verification guard: only start AF if the stage has
+        # actually arrived at SAFE_CENTER. A stale/premature
+        # move_to_ctrl.finished has been observed to fire this callback
+        # while z_homing is still running — AF then sweeps Z on top of the
+        # in-progress homing move. If we're not at target yet, poll every
+        # 200 ms (bounded to ~60 s) instead of starting AF.
+        POS_TOL_FS = 2.0
+        cur_x, cur_y, cur_z = self._cur_x(), self._cur_y(), self._cur_z()
+        at_target = (abs(cur_x - SAFE_CENTER_X_FS) <= POS_TOL_FS
+                     and abs(cur_y - SAFE_CENTER_Y_FS) <= POS_TOL_FS
+                     and abs(cur_z - 0.0) <= POS_TOL_FS)
+        if not at_target:
+            polls = getattr(self, '_center_arrival_polls', 0) + 1
+            self._center_arrival_polls = polls
+            if polls <= 300:  # 300 * 200ms = 60s
+                print(f"[OrientCal id={id(self)}] _start_autofocus deferred: "
+                      f"not at SAFE_CENTER yet "
+                      f"(cur=({cur_x:.1f}, {cur_y:.1f}, {cur_z:.1f}) "
+                      f"target=({SAFE_CENTER_X_FS}, {SAFE_CENTER_Y_FS}, 0.0)) "
+                      f"poll {polls}/300")
+                QTimer.singleShot(200, self._start_autofocus)
+                return
+            print(f"[OrientCal id={id(self)}] _start_autofocus: arrival "
+                  f"timeout after {polls} polls — proceeding anyway")
+        self._center_arrival_polls = 0
+
         self._af_kickoff_pending = False
         print(f"[OrientCal id={id(self)}] _start_autofocus fired, phase was {self._phase}")
         self._phase = 'initial_af'
