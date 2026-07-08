@@ -1190,8 +1190,8 @@ class OrientCalibrationController(QObject):
 
         # Override settings for calibration: AF every tile, wider search
         self._z_scan.AF_EVERY_N_TILES = 1
-        self._z_scan.SCAN_SIZE = 10
-        self._z_scan._scan_size = 10
+        self._z_scan.SCAN_SIZE = 8
+        self._z_scan._scan_size = 8
         self._z_scan._center_col = 15
         self._z_scan._center_row = 15
         self._z_scan.LEARN_RATE = 0.08
@@ -1322,7 +1322,7 @@ class OrientCalibrationController(QObject):
 
         from spiral_scan import SpiralScanController
 
-        self._refine_cycles_target = 1
+        self._refine_cycles_target = 2
         self._refine_cycles_done = 0
 
         self._z_scan = SpiralScanController(
@@ -1337,8 +1337,8 @@ class OrientCalibrationController(QObject):
         )
 
         # Normal scan settings — match what the real scan will use
-        self._z_scan.SCAN_SIZE = 10
-        self._z_scan._scan_size = 10
+        self._z_scan.SCAN_SIZE = 8
+        self._z_scan._scan_size = 8
         self._z_scan._center_col = 15
         self._z_scan._center_row = 15
         # AF_EVERY_N_TILES = 2 (default)
@@ -1351,8 +1351,8 @@ class OrientCalibrationController(QObject):
 
         self._phase = 'refine_spiral_scan'
 
-        print(f"[OrientCal] Starting refinement scan (1 cycle, AF every 2, normal settings)...")
-        self.progress.emit('refining', 'Refinement scan: cycle 1/1...')
+        print(f"[OrientCal] Starting refinement scan (2 cycles, AF every 2, normal settings)...")
+        self.progress.emit('refining', 'Refinement scan: cycle 1/2...')
         self._z_scan.start(self._camera_settings)
 
     def _on_refine_scan_progress(self, phase, message):

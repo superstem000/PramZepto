@@ -1420,9 +1420,12 @@ class MovePlannerWidget(QWidget):
             self._pending_cal_during_dwell = True
             self._cal_skip_move_to_center = True
             self._set_status(
-                f"Step {self._exec_index + 1}: Calibration (~30 min)..."
+                f"Step {self._exec_index + 1}: Calibration (30 min incubation)..."
             )
-            self._start_dwell(1)
+            # Real 30-minute incubation timer running in parallel with cal.
+            # If cal finishes early, we still wait the full 30 min. If cal
+            # runs long, _waiting_for_cal holds until it completes.
+            self._start_dwell(30 * 60 * 1000)
             return
 
         # If in microfluidics sub-sequence, check dwell then advance
