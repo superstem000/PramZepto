@@ -161,7 +161,6 @@ class MovePlannerWidget(QWidget):
         self._pending_cal_during_dwell = False  # set per-step from RecipeStep
         self._micro_seq_index = -1  # sub-index within microfluidics sequence
         self._micro_seq_source = []  # which sequence we're executing (PUSH1, PUSH2, or full)
-        self._cal_step_active = False  # standalone calibration step in progress
         self._saved_speed_mult = 1.0
         self._saved_z_limit = None  # saved z_global_max for restore
 
@@ -983,7 +982,6 @@ class MovePlannerWidget(QWidget):
         self._exec_index = -1
         self._micro_seq_index = -1
         self._micro_seq_source = []
-        self._cal_step_active = False
         if self.btn_execute:
             self.btn_execute.setEnabled(False)
         if self.btn_stop:
@@ -1002,20 +1000,8 @@ class MovePlannerWidget(QWidget):
         self._exec_index = -1
         self._micro_seq_index = -1
         self._micro_seq_source = []
-        self._cal_step_active = False
         # Stop any running cal we kicked off during a dwell
         self._cleanup_cal_during_dwell(stop_cal=True)
-        # Stop any running standalone-step cal we kicked off
-        if self._orient_cal is not None:
-            try:
-                self._orient_cal.finished.disconnect(self._on_calibration_step_finished)
-            except Exception:
-                pass
-            try:
-                if self._orient_cal.is_active():
-                    self._orient_cal.stop("Recipe stopped")
-            except Exception:
-                pass
         # Stop any running spiral scan we kicked off
         self._cleanup_spiral_scan(stop_scan=True)
         self._restore_z_limit()
@@ -1078,9 +1064,16 @@ class MovePlannerWidget(QWidget):
             self._set_status(f"Step {self._exec_index + 1}: µFluidics Push 2...")
             self._advance_microfluidics()
         elif step.step_type == "calibration":
-            self._pending_dwell_ms = step.dwell_ms
-            self._pending_cal_during_dwell = False
-            self._execute_calibration_step(step)
+            # Reuse the working cal-during-dwell path: start a 1 ms dwell with
+            # cal-during-dwell=True. The dwell timer expires almost immediately;
+            # if cal is still running (it will be — takes ~30 min), the existing
+            # `_waiting_for_cal` mechanism holds until cal finishes, then
+            # advances the recipe. Same code path as the legacy 1-hour dwell
+            # step; nothing new to race.
+            self._pending_dwell_ms = 0
+            self._pending_cal_during_dwell = True
+            self._set_status(f"Step {self._exec_index + 1}: Calibration (~30 min)...")
+            self._start_dwell(1)
         elif step.step_type == "spiral_scan":
             self._pending_dwell_ms = step.dwell_ms
             self._pending_cal_during_dwell = False
@@ -1150,96 +1143,6 @@ class MovePlannerWidget(QWidget):
         )
 
         self._execute_move_step(sub_step)
-
-    # =========================
-    # Standalone calibration step
-    # =========================
-
-    def _execute_calibration_step(self, step: RecipeStep):
-        """Run orientation calibration to completion as its own recipe step.
-        Advances when orient_cal.finished fires. If the recipe step also has
-        a post-dwell, the dwell runs afterwards as with any other step."""
-        if not self._exec_active:
-            return
-
-        if self._orient_cal is None:
-            print("[Planner] calibration step requested but no orient_cal "
-                  "controller wired up — skipping.")
-            self._set_status(f"Step {self._exec_index + 1}: Calibration: "
-                             f"no controller, skipping.")
-            self._handle_dwell_or_advance()
-            return
-
-        if self._orient_cal.is_active():
-            print("[Planner] calibration step requested but orient_cal is "
-                  "already active — tracking its finish for the advance.")
-            self._cal_step_active = True
-            try:
-                self._orient_cal.finished.connect(self._on_calibration_step_finished)
-            except Exception:
-                pass
-            self._set_status(f"Step {self._exec_index + 1}: Calibration (already running)...")
-            return
-
-        settings = {}
-        try:
-            if callable(self._camera_settings_provider):
-                settings = self._camera_settings_provider() or {}
-        except Exception as e:
-            print(f"[Planner] Camera settings provider failed: {e}")
-
-        try:
-            self._orient_cal.finished.connect(self._on_calibration_step_finished)
-        except Exception:
-            pass
-
-        self._cal_step_active = True
-        self._set_status(f"Step {self._exec_index + 1}: Calibration (~30 min)...")
-
-        # Defer to the next event-loop tick. We're reached from inside a
-        # move_to_ctrl.finished emission (the prior step's move completing —
-        # potentially "already at target", which fires `finished` synchronously).
-        # orient_cal.start() synchronously issues its own move_to_ctrl.start()
-        # for move-to-center; doing that here means OrientCal's own
-        # _on_move_finished slot — invoked later in the SAME finished
-        # emission — could mistake the in-flight signal for its move-to-center
-        # completing and kick off the XY move + autofocus prematurely,
-        # racing the still-in-progress motion. Deferring lets the current
-        # emission fully drain (controller still inactive) before cal begins.
-        # See commit d123a7a for the original fix on the dwell path.
-        QTimer.singleShot(0, lambda s=settings: self._deferred_cal_step_start(s))
-
-    def _deferred_cal_step_start(self, settings):
-        """Start orient cal on a clean stack (see _execute_calibration_step).
-        Bail if the recipe was stopped before this fired."""
-        if not self._exec_active or not self._cal_step_active:
-            return
-        if self._orient_cal is None:
-            return
-        try:
-            self._orient_cal.start(settings)
-        except Exception as e:
-            print(f"[Planner] orient_cal.start failed: {e}")
-            self._cal_step_active = False
-            try:
-                self._orient_cal.finished.disconnect(self._on_calibration_step_finished)
-            except Exception:
-                pass
-            self._finish_execution(f"Calibration start failed: {e}")
-
-    def _on_calibration_step_finished(self, success: bool, message: str, result):
-        """Standalone calibration step done — advance the recipe."""
-        if not self._cal_step_active:
-            return
-        self._cal_step_active = False
-        try:
-            self._orient_cal.finished.disconnect(self._on_calibration_step_finished)
-        except Exception:
-            pass
-        if not self._exec_active:
-            return
-        print(f"[Planner] Calibration step finished: ok={success} msg={message}")
-        self._handle_dwell_or_advance()
 
     # =========================
     # Spiral scan step
@@ -1466,12 +1369,8 @@ class MovePlannerWidget(QWidget):
         # something OTHER than our recipe (e.g. orientation calibration
         # moving the stage during the dwell). The dwell timer / cal-finished
         # signal is in charge of advancing — not move_to_ctrl.
-        # Same for the standalone calibration step (_cal_step_active):
-        # OrientCal issues its own move_to_ctrl moves for move-to-center,
-        # row/col scans, spiral scans, etc.; the calibration's finished
-        # signal is the only thing that should advance the recipe.
         if self._dwell_timer.isActive() or self._waiting_for_cal \
-                or self._cal_running_for_step or self._cal_step_active:
+                or self._cal_running_for_step:
             return
 
         # Same idea for an active spiral scan: it issues its own moves.
@@ -1680,7 +1579,6 @@ class MovePlannerWidget(QWidget):
         self._exec_index = -1
         self._micro_seq_index = -1
         self._micro_seq_source = []
-        self._cal_step_active = False
         # Disconnect our cal slot but don't stop a running cal — if it's still
         # going when the recipe ends naturally, let it finish.
         self._cleanup_cal_during_dwell(stop_cal=False)
