@@ -25,21 +25,25 @@ class RecipeStep:
     """One step in a recipe. Type determines how it's executed.
 
     Types:
-        'move'          — move to absolute XYZ (microsteps) at given speed
-        'microfluidics' — run the hardcoded microfluidics sub-sequence
-        'spiral_scan'   — run a spiral scan (one cycle), then advance
+        'move'                — move to absolute XYZ (microsteps) at given speed
+        'microfluidics'       — LEGACY: full hardcoded sequence (push1+push2)
+        'microfluidics_push1' — first push only (approach → slow push → retract)
+        'microfluidics_push2' — second push + final Z retract
+        'calibration'         — run full orient calibration to completion
+                                (~30 min including z-tilt spiral scan + one
+                                refinement cycle). Doubles as an incubation
+                                window between microfluidics pushes.
+        'spiral_scan'         — run a spiral scan (num_cycles cycles), then advance
 
     Fields used per type:
-        move:           x_us, y_us, z_us, speed, dwell_ms, override_z_limit
-        microfluidics:  dwell_ms (wait after completion)
-        spiral_scan:    dwell_ms (wait after one cycle completes). The
-                        scan controller picks up its settings from the
-                        provider registered with the planner — typically
-                        the stepper widget's scan settings UI (interval,
-                        center_col, center_row), matching what the
-                        stepper-widget Spiral Scan button does.
+        move:                x_us, y_us, z_us, speed, dwell_ms, override_z_limit
+        microfluidics*:      dwell_ms (wait after completion)
+        calibration:         dwell_ms (wait after cal finishes)
+        spiral_scan:         dwell_ms, num_cycles, scan_size. Scan controller
+                             picks up interval + center from the stepper
+                             widget's scan-settings UI at execute-time.
     """
-    step_type: str = "move"       # "move", "microfluidics", "spiral_scan"
+    step_type: str = "move"       # see class docstring for valid values
     x_us: int = 0                 # X in microsteps (mres=32)
     y_us: int = 0                 # Y in microsteps
     z_us: int = 0                 # Z in microsteps
@@ -64,7 +68,7 @@ class MoveRecipe:
 # Microfluidics hardcoded sequence (all positions in microsteps)
 # ═══════════════════════════════════════════════════════════════
 
-MICROFLUIDICS_SEQUENCE = [
+MICROFLUIDICS_PUSH1 = [
     # Move to push position 1
     RecipeStep(step_type="move", x_us=35867, y_us=19270, z_us=22589,
                speed=2.67, override_z_limit=True),
@@ -74,17 +78,12 @@ MICROFLUIDICS_SEQUENCE = [
     # Slow push
     RecipeStep(step_type="move", x_us=10677, y_us=19270, z_us=22589,
                speed=0.02, override_z_limit=True),
-    # Fast retract
+    # Fast retract to safe park position
     RecipeStep(step_type="move", x_us=35867, y_us=19270, z_us=22589,
                speed=2.67, override_z_limit=True),
-    # 1-hour wait between pushes — orient calibration runs in parallel during
-    # the dwell. If cal takes longer than 1 hour, planner waits for it to
-    # finish before advancing to push 2.
-    RecipeStep(step_type="move", x_us=35867, y_us=19270, z_us=22589,
-               speed=2.67, override_z_limit=True,
-               dwell_ms=60 * 60 * 1000, #*************************************************************
-               run_calibration_during_dwell=True,
-               note="1 hour wait between pushes (calibration runs in parallel)"),
+]
+
+MICROFLUIDICS_PUSH2 = [
     # Move to push position 2
     RecipeStep(step_type="move", x_us=35867, y_us=36986, z_us=22589,
                speed=2.67, override_z_limit=True),
@@ -94,15 +93,22 @@ MICROFLUIDICS_SEQUENCE = [
     # Slow push
     RecipeStep(step_type="move", x_us=10677, y_us=36986, z_us=22589,
                speed=0.02, override_z_limit=True),
-    # Fast retract — then 20-minute settle wait before final Z retract
+    # Fast retract to safe park position (previously followed by an optional
+    # 20-min settle then a full Z retract — keeping the retract-to-park to
+    # stay consistent with push 1's finishing state; user can add a Move
+    # step for a further Z retract if desired).
     RecipeStep(step_type="move", x_us=35867, y_us=36986, z_us=22589,
-               speed=2.67, override_z_limit=True,
-               #dwell_ms=20 * 60 * 1000, #***************************************************************
-               note="Settle 20 min before final Z retract"),
+               speed=2.67, override_z_limit=True),
     # Final Z retract
     RecipeStep(step_type="move", x_us=35867, y_us=36986, z_us=0,
                speed=2.67, override_z_limit=True),
 ]
+
+# Legacy backwards-compat: old recipes on disk with step_type="microfluidics"
+# still load and execute as push1 → (no cal, no dwell) → push2. Users can
+# rebuild the recipe with the new split step types + a calibration step to
+# get the incubation-in-cal-window behaviour.
+MICROFLUIDICS_SEQUENCE = MICROFLUIDICS_PUSH1 + MICROFLUIDICS_PUSH2
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -154,6 +160,8 @@ class MovePlannerWidget(QWidget):
         self._pending_dwell_ms = 0
         self._pending_cal_during_dwell = False  # set per-step from RecipeStep
         self._micro_seq_index = -1  # sub-index within microfluidics sequence
+        self._micro_seq_source = []  # which sequence we're executing (PUSH1, PUSH2, or full)
+        self._cal_step_active = False  # standalone calibration step in progress
         self._saved_speed_mult = 1.0
         self._saved_z_limit = None  # saved z_global_max for restore
 
@@ -233,7 +241,9 @@ class MovePlannerWidget(QWidget):
         for s in steps:
             if getattr(s, "run_calibration_during_dwell", False):
                 return True
-            # Microfluidics step expands into MICROFLUIDICS_SEQUENCE — check that too
+            if s.step_type == "calibration":
+                return True
+            # Legacy microfluidics step expands into MICROFLUIDICS_SEQUENCE
             if s.step_type == "microfluidics":
                 for sub in MICROFLUIDICS_SEQUENCE:
                     if getattr(sub, "run_calibration_during_dwell", False):
@@ -301,11 +311,34 @@ class MovePlannerWidget(QWidget):
         self.btn_add_move.clicked.connect(self._on_add_move_step)
         type_layout.addWidget(self.btn_add_move)
 
-        self.btn_add_microfluidics = QPushButton("Microfluidics")
-        self.btn_add_microfluidics.setMinimumHeight(150)
-        self.btn_add_microfluidics.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
-        self.btn_add_microfluidics.clicked.connect(self._on_add_microfluidics)
-        type_layout.addWidget(self.btn_add_microfluidics)
+        # Three separate buttons where the single "Microfluidics" used to be.
+        # Each ~80px so the total block (240 + 2×8 spacing = ~256px) grows
+        # only ~106px vs the old 150px single button — well within the scroll
+        # area. Text stays readable at 14pt because the global stylesheet's
+        # 10-20px padding leaves plenty of horizontal room in the ~700px wide
+        # button (only ~200px of text width needed for "µFluidics Push 1").
+        self.btn_add_push1 = QPushButton("µFluidics Push 1")
+        self.btn_add_push1.setMinimumHeight(80)
+        self.btn_add_push1.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+        self.btn_add_push1.clicked.connect(self._on_add_microfluidics_push1)
+        type_layout.addWidget(self.btn_add_push1)
+
+        self.btn_add_calibration = QPushButton("Calibration")
+        self.btn_add_calibration.setMinimumHeight(80)
+        self.btn_add_calibration.setStyleSheet("background-color: #9C27B0; color: white; font-weight: bold;")
+        self.btn_add_calibration.clicked.connect(self._on_add_calibration)
+        type_layout.addWidget(self.btn_add_calibration)
+
+        self.btn_add_push2 = QPushButton("µFluidics Push 2")
+        self.btn_add_push2.setMinimumHeight(80)
+        self.btn_add_push2.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+        self.btn_add_push2.clicked.connect(self._on_add_microfluidics_push2)
+        type_layout.addWidget(self.btn_add_push2)
+
+        # Kept for backwards-compat: btn_add_microfluidics reference points to
+        # the push1 button so any external code that still references it (rare)
+        # doesn't crash.
+        self.btn_add_microfluidics = self.btn_add_push1
 
         # Spiral scan add: button + size/cycles inputs that the step will use.
         # Inline so the user doesn't have to go change the manual-mode scan
@@ -541,13 +574,42 @@ class MovePlannerWidget(QWidget):
         self._set_status("Added move step.")
 
     def _on_add_microfluidics(self):
+        """Legacy single-step microfluidics — kept for any external callers.
+        New recipes should use push1 + calibration + push2 as three steps."""
         step = RecipeStep(
             step_type="microfluidics",
             dwell_ms=self.dwell_ms.value(),
-            note="Microfluidics routine",
+            note="Microfluidics routine (legacy: push1 + push2 no gap)",
         )
         self._add_step_to_table(step)
-        self._set_status("Added microfluidics step.")
+        self._set_status("Added microfluidics (legacy) step.")
+
+    def _on_add_microfluidics_push1(self):
+        step = RecipeStep(
+            step_type="microfluidics_push1",
+            dwell_ms=self.dwell_ms.value(),
+            note="µFluidics Push 1 (approach → slow push → retract)",
+        )
+        self._add_step_to_table(step)
+        self._set_status("Added µFluidics Push 1 step.")
+
+    def _on_add_microfluidics_push2(self):
+        step = RecipeStep(
+            step_type="microfluidics_push2",
+            dwell_ms=self.dwell_ms.value(),
+            note="µFluidics Push 2 (approach → slow push → retract → Z retract)",
+        )
+        self._add_step_to_table(step)
+        self._set_status("Added µFluidics Push 2 step.")
+
+    def _on_add_calibration(self):
+        step = RecipeStep(
+            step_type="calibration",
+            dwell_ms=self.dwell_ms.value(),
+            note="Full orient calibration (~30 min; doubles as incubation)",
+        )
+        self._add_step_to_table(step)
+        self._set_status("Added Calibration step.")
 
     def _on_add_spiral_scan(self):
         # Read scan size + cycle count from this widget's own inputs, so each
@@ -594,6 +656,24 @@ class MovePlannerWidget(QWidget):
         elif step.step_type == "microfluidics":
             type_item = QTableWidgetItem("µFluidics")
             type_item.setBackground(Qt.GlobalColor.darkYellow)
+            for c in (2, 3, 4, 5):
+                self.table.setItem(r, c, QTableWidgetItem("—"))
+            self.table.setItem(r, 6, QTableWidgetItem(str(step.dwell_ms) if step.dwell_ms else ""))
+        elif step.step_type == "microfluidics_push1":
+            type_item = QTableWidgetItem("µFluidics 1")
+            type_item.setBackground(Qt.GlobalColor.darkYellow)
+            for c in (2, 3, 4, 5):
+                self.table.setItem(r, c, QTableWidgetItem("—"))
+            self.table.setItem(r, 6, QTableWidgetItem(str(step.dwell_ms) if step.dwell_ms else ""))
+        elif step.step_type == "microfluidics_push2":
+            type_item = QTableWidgetItem("µFluidics 2")
+            type_item.setBackground(Qt.GlobalColor.darkYellow)
+            for c in (2, 3, 4, 5):
+                self.table.setItem(r, c, QTableWidgetItem("—"))
+            self.table.setItem(r, 6, QTableWidgetItem(str(step.dwell_ms) if step.dwell_ms else ""))
+        elif step.step_type == "calibration":
+            type_item = QTableWidgetItem("Calibrate")
+            type_item.setBackground(Qt.GlobalColor.darkMagenta)
             for c in (2, 3, 4, 5):
                 self.table.setItem(r, c, QTableWidgetItem("—"))
             self.table.setItem(r, 6, QTableWidgetItem(str(step.dwell_ms) if step.dwell_ms else ""))
@@ -902,6 +982,8 @@ class MovePlannerWidget(QWidget):
         self._exec_active = True
         self._exec_index = -1
         self._micro_seq_index = -1
+        self._micro_seq_source = []
+        self._cal_step_active = False
         if self.btn_execute:
             self.btn_execute.setEnabled(False)
         if self.btn_stop:
@@ -919,6 +1001,8 @@ class MovePlannerWidget(QWidget):
         self._exec_active = False
         self._exec_index = -1
         self._micro_seq_index = -1
+        self._micro_seq_source = []
+        self._cal_step_active = False
         # Stop any running cal we kicked off during a dwell
         self._cleanup_cal_during_dwell(stop_cal=True)
         # Stop any running spiral scan we kicked off
@@ -961,11 +1045,31 @@ class MovePlannerWidget(QWidget):
         if step.step_type == "move":
             self._execute_move_step(step)
         elif step.step_type == "microfluidics":
+            # Legacy: run full push1 + push2 as a single expanded sequence.
             self._pending_dwell_ms = step.dwell_ms
-            self._pending_cal_during_dwell = False  # outer wrapper has no cal flag
+            self._pending_cal_during_dwell = False
+            self._micro_seq_source = list(MICROFLUIDICS_SEQUENCE)
             self._micro_seq_index = 0
-            self._set_status(f"Step {self._exec_index + 1}: Microfluidics...")
+            self._set_status(f"Step {self._exec_index + 1}: Microfluidics (legacy)...")
             self._advance_microfluidics()
+        elif step.step_type == "microfluidics_push1":
+            self._pending_dwell_ms = step.dwell_ms
+            self._pending_cal_during_dwell = False
+            self._micro_seq_source = list(MICROFLUIDICS_PUSH1)
+            self._micro_seq_index = 0
+            self._set_status(f"Step {self._exec_index + 1}: µFluidics Push 1...")
+            self._advance_microfluidics()
+        elif step.step_type == "microfluidics_push2":
+            self._pending_dwell_ms = step.dwell_ms
+            self._pending_cal_during_dwell = False
+            self._micro_seq_source = list(MICROFLUIDICS_PUSH2)
+            self._micro_seq_index = 0
+            self._set_status(f"Step {self._exec_index + 1}: µFluidics Push 2...")
+            self._advance_microfluidics()
+        elif step.step_type == "calibration":
+            self._pending_dwell_ms = step.dwell_ms
+            self._pending_cal_during_dwell = False
+            self._execute_calibration_step(step)
         elif step.step_type == "spiral_scan":
             self._pending_dwell_ms = step.dwell_ms
             self._pending_cal_during_dwell = False
@@ -1011,26 +1115,99 @@ class MovePlannerWidget(QWidget):
     # =========================
 
     def _advance_microfluidics(self):
-        """Execute the next step in the microfluidics sub-sequence."""
+        """Execute the next step in the currently-selected microfluidics
+        sub-sequence (either PUSH1, PUSH2, or the legacy full sequence,
+        depending on which step_type triggered execution)."""
         if not self._exec_active:
             return
-        if self._micro_seq_index >= len(MICROFLUIDICS_SEQUENCE):
+        seq = self._micro_seq_source
+        if self._micro_seq_index >= len(seq):
             # Sub-sequence complete
             self._micro_seq_index = -1
+            self._micro_seq_source = []
             self._restore_z_limit()
             self._set_status(f"Step {self._exec_index + 1}: Microfluidics complete.")
             self._handle_dwell_or_advance()
             return
 
-        sub_step = MICROFLUIDICS_SEQUENCE[self._micro_seq_index]
+        sub_step = seq[self._micro_seq_index]
         self._micro_seq_index += 1
 
         self._set_status(
             f"Step {self._exec_index + 1}: µFluidics "
-            f"[{self._micro_seq_index}/{len(MICROFLUIDICS_SEQUENCE)}]"
+            f"[{self._micro_seq_index}/{len(seq)}]"
         )
 
         self._execute_move_step(sub_step)
+
+    # =========================
+    # Standalone calibration step
+    # =========================
+
+    def _execute_calibration_step(self, step: RecipeStep):
+        """Run orientation calibration to completion as its own recipe step.
+        Advances when orient_cal.finished fires. If the recipe step also has
+        a post-dwell, the dwell runs afterwards as with any other step."""
+        if not self._exec_active:
+            return
+
+        if self._orient_cal is None:
+            print("[Planner] calibration step requested but no orient_cal "
+                  "controller wired up — skipping.")
+            self._set_status(f"Step {self._exec_index + 1}: Calibration: "
+                             f"no controller, skipping.")
+            self._handle_dwell_or_advance()
+            return
+
+        if self._orient_cal.is_active():
+            print("[Planner] calibration step requested but orient_cal is "
+                  "already active — tracking its finish for the advance.")
+            self._cal_step_active = True
+            try:
+                self._orient_cal.finished.connect(self._on_calibration_step_finished)
+            except Exception:
+                pass
+            self._set_status(f"Step {self._exec_index + 1}: Calibration (already running)...")
+            return
+
+        settings = {}
+        try:
+            if callable(self._camera_settings_provider):
+                settings = self._camera_settings_provider() or {}
+        except Exception as e:
+            print(f"[Planner] Camera settings provider failed: {e}")
+
+        try:
+            self._orient_cal.finished.connect(self._on_calibration_step_finished)
+        except Exception:
+            pass
+
+        self._cal_step_active = True
+        self._set_status(f"Step {self._exec_index + 1}: Calibration (~30 min)...")
+        try:
+            self._orient_cal.start(settings)
+        except Exception as e:
+            print(f"[Planner] orient_cal.start failed: {e}")
+            self._cal_step_active = False
+            try:
+                self._orient_cal.finished.disconnect(self._on_calibration_step_finished)
+            except Exception:
+                pass
+            self._finish_execution(f"Calibration start failed: {e}")
+
+    def _on_calibration_step_finished(self, success: bool, message: str, result):
+        """Standalone calibration step done — advance the recipe."""
+        if not self._cal_step_active:
+            return
+        self._cal_step_active = False
+        try:
+            self._orient_cal.finished.disconnect(self._on_calibration_step_finished)
+        except Exception:
+            pass
+        if not self._exec_active:
+            return
+        print(f"[Planner] Calibration step finished: ok={success} msg={message}")
+        self._handle_dwell_or_advance()
 
     # =========================
     # Spiral scan step
@@ -1466,6 +1643,8 @@ class MovePlannerWidget(QWidget):
         self._exec_active = False
         self._exec_index = -1
         self._micro_seq_index = -1
+        self._micro_seq_source = []
+        self._cal_step_active = False
         # Disconnect our cal slot but don't stop a running cal — if it's still
         # going when the recipe ends naturally, let it finish.
         self._cleanup_cal_during_dwell(stop_cal=False)

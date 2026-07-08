@@ -1281,7 +1281,7 @@ class OrientCalibrationController(QObject):
 
         from spiral_scan import SpiralScanController
 
-        self._refine_cycles_target = 2
+        self._refine_cycles_target = 1
         self._refine_cycles_done = 0
 
         self._z_scan = SpiralScanController(
@@ -1310,8 +1310,8 @@ class OrientCalibrationController(QObject):
 
         self._phase = 'refine_spiral_scan'
 
-        print(f"[OrientCal] Starting refinement scan (2 cycles, AF every 2, normal settings)...")
-        self.progress.emit('refining', 'Refinement scan: cycle 1/2...')
+        print(f"[OrientCal] Starting refinement scan (1 cycle, AF every 2, normal settings)...")
+        self.progress.emit('refining', 'Refinement scan: cycle 1/1...')
         self._z_scan.start(self._camera_settings)
 
     def _on_refine_scan_progress(self, phase, message):
