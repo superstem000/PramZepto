@@ -338,7 +338,8 @@ class MovePlannerWidget(QWidget):
         self.btn_add_orient_cal.setMinimumHeight(80)
         self.btn_add_orient_cal.setStyleSheet("background-color: #009688; color: white; font-weight: bold;")
         self.btn_add_orient_cal.setToolTip(
-            "Orientation-only re-calibration (~5-8 min, no incubation).\n"
+            "Orientation-only re-calibration (~1 min, no incubation).\n"
+            "Minimal scan (2 half-tile steps per axis, no per-step AF).\n"
             "Reuses prior full calibration's motor↔px + Z-tilt; only "
             "re-detects orientation. Requires a valid prior calibration on disk."
         )
@@ -631,7 +632,7 @@ class MovePlannerWidget(QWidget):
         step = RecipeStep(
             step_type="orientation_calibration",
             dwell_ms=0,  # no incubation timer for this variant
-            note="Orient-only cal (~5-8 min, reuses prior full cal)",
+            note="Orient-only cal (~1 min, reuses prior full cal)",
         )
         self._add_step_to_table(step)
         self._set_status("Added Orient Cal step.")
@@ -1481,7 +1482,7 @@ class MovePlannerWidget(QWidget):
             self._cal_skip_move_to_center = True
             if self._cal_mode == 'orientation_only':
                 self._set_status(
-                    f"Step {self._exec_index + 1}: Orient-only cal (~5-8 min)..."
+                    f"Step {self._exec_index + 1}: Orient-only cal (~1 min)..."
                 )
                 self._start_dwell(1)
             else:

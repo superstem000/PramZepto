@@ -431,6 +431,13 @@ class OrientCalibrationController(QObject):
             return
 
         self._mode = mode
+        # Orientation-only mode: shrink the forward-scan count from
+        # SCAN_STEPS=10 to 2 per direction. Combined with skip-reverse-pass
+        # (in _scan_capture_and_advance) and skip-per-step-AF (in
+        # _do_quick_af), total time drops from ~5-8 min to ~30-60 sec.
+        # analyze_orientation only needs ~3 valid samples per direction to
+        # score reliably; forward 2 + initial center = 3.
+        self._orient_scan_steps = 2 if mode == 'orientation_only' else SCAN_STEPS
         self._active = True
         self._stop_requested = False
         self._af_kickoff_pending = False
@@ -525,6 +532,12 @@ class OrientCalibrationController(QObject):
 
     def _do_quick_af(self, next_phase):
         self._phase = next_phase
+        # Orientation-only mode: skip per-step quick AF. Half-tile moves
+        # near the safe-center don't drift focus enough to matter for
+        # marker-ID decoding, and skipping cuts ~5s per step.
+        if self._mode == 'orientation_only':
+            QTimer.singleShot(SETTLE_MS, lambda: self._on_af_finished(True, "orient-only: no AF"))
+            return
         if self.af_controller:
             QTimer.singleShot(SETTLE_MS,
                 lambda: self.af_controller.start_quick(
@@ -599,13 +612,21 @@ class OrientCalibrationController(QObject):
         self._af_kickoff_pending = False
         print(f"[OrientCal id={id(self)}] _start_autofocus fired, phase was {self._phase}")
         self._phase = 'initial_af'
-        self.progress.emit('af', 'Calibration AF (Z=130..200)...')
         if self.af_controller:
-            # Wide-sweep calibration AF: stage 1 sweeps Z=100..200 at 1.5fs,
-            # subsequent stages refine, and the final best Z is persisted to
-            # calibration.json under 'known_focus_fs' for future regular AF
-            # runs.
-            self.af_controller.start_calibration_af(self._camera_settings)
+            if self._mode == 'orientation_only':
+                # Orientation-only: quick AF (a few positions around the last
+                # known focus). Marker decoding tolerates loose focus, and the
+                # full calibration AF's 101-position wide sweep is overkill
+                # here. Cuts ~30-60s off the initial AF phase.
+                self.progress.emit('af', 'Quick AF (orient-only)...')
+                self.af_controller.start_quick(self._camera_settings)
+            else:
+                # Wide-sweep calibration AF: stage 1 sweeps Z=100..200 at
+                # 1.5fs, subsequent stages refine, and the final best Z is
+                # persisted to calibration.json under 'known_focus_fs' for
+                # future regular AF runs.
+                self.progress.emit('af', 'Calibration AF (Z=130..200)...')
+                self.af_controller.start_calibration_af(self._camera_settings)
         else:
             QTimer.singleShot(SETTLE_MS, self._capture_reference)
 
@@ -697,7 +718,20 @@ class OrientCalibrationController(QObject):
         else:
             print(f"[OrientCal] {direction}-scan step {self._scan_step}: no detection")
 
-        if self._scan_step > SCAN_STEPS:
+        # Orientation-only mode uses a much shorter scan (no reverse pass,
+        # fewer forward steps). It jumps straight to the snap-back / next
+        # direction once _orient_scan_steps forward samples are in.
+        steps_target = getattr(self, '_orient_scan_steps', SCAN_STEPS)
+        if self._scan_step > steps_target:
+            if self._mode == 'orientation_only':
+                # Skip reverse pass entirely — snap back to center and
+                # continue via the same phase used at the end of reverse.
+                self._scan_reverse_direction = direction
+                self._phase = f'{direction}_scan_snap'
+                self.progress.emit('orient', 'Snapping back to center...')
+                self.move_to_ctrl.start(self._scan_center_x, self._scan_center_y,
+                                         self._cur_z())
+                return
             self._reverse_steps_remaining = SCAN_STEPS
             self._scan_reverse_direction = direction
             self.progress.emit('orient', f'Reversing {direction} scan...')
