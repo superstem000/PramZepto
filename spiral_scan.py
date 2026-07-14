@@ -1136,7 +1136,17 @@ class SpiralScanController(QObject):
         cand_col, cand_row = self._skip_candidate
         dcol = cand_col - gcol
         drow = cand_row - grow
-        delta_fs = dcol * cal.grid_pitch_col_fs + drow * cal.grid_pitch_row_fs
+        # Convention (matches _compute_move_delta / stage_cal storage):
+        # grid_pitch_*_fs is the within-frame pitch of the plate view. Moving
+        # stage by +grid_pitch_col_fs shifts pixels forward, which pulls the
+        # LOWER col_id into center — so reaching +dcol needs the NEGATIVE.
+        # An earlier version of this hop used +dcol * col_fs; that happened to
+        # look right on a chip whose stored col_fs had the opposite sign, but
+        # left this hop in silent disagreement with the walk formula. After
+        # the orient-only sign-correction pass the two conventions diverge
+        # visibly (hop lands off by 2× the intended distance in the wrong
+        # direction), so they're unified here.
+        delta_fs = -dcol * cal.grid_pitch_col_fs - drow * cal.grid_pitch_row_fs
         dz = self._dz_per_col * dcol + self._dz_per_row * drow  # tilt-aware; AF refines
         tx = gx + float(delta_fs[0])
         ty = gy + float(delta_fs[1])
