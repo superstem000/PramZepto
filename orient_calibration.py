@@ -333,6 +333,7 @@ class OrientCalibrationController(QObject):
         self._active = False
         self._stop_requested = False
         self._phase = 'idle'
+        self._mode = 'full'  # 'full' or 'orientation_only'; set in start()
         self._camera_settings = {}
         self._saved_speed_mult = 1.0
         self._af_kickoff_pending = False
@@ -399,8 +400,18 @@ class OrientCalibrationController(QObject):
     def is_active(self) -> bool:
         return self._active
 
-    def start(self, camera_settings, skip_move_to_center=False):
+    def start(self, camera_settings, skip_move_to_center=False, mode='full'):
         """Start orientation calibration.
+
+        mode:
+          'full' (default) — row/col scans → orientation → motor↔px matrix →
+                             Z-tilt scan → refinement cycles. ~30 min.
+          'orientation_only' — row/col scans → orientation → save. Skips the
+                             matrix compute, Z-tilt scan, and refinement.
+                             REQUIRES a prior valid calibration on disk
+                             (the loaded motor↔px / Z-tilt / grid-pitch are
+                             preserved and re-saved with the new orientation).
+                             ~5-8 min.
 
         If skip_move_to_center=True, the caller guarantees the stage is
         already at (SAFE_CENTER_X_FS, SAFE_CENTER_Y_FS, 0). We skip the
@@ -413,7 +424,13 @@ class OrientCalibrationController(QObject):
         if not self.camera_preview.is_running():
             self.finished.emit(False, "Start live preview first.", None)
             return
+        if mode == 'orientation_only' and not self.result.valid:
+            self.finished.emit(False,
+                "Orientation-only calibration requires a prior full "
+                "calibration on disk. Run full calibration first.", None)
+            return
 
+        self._mode = mode
         self._active = True
         self._stop_requested = False
         self._af_kickoff_pending = False
@@ -739,6 +756,18 @@ class OrientCalibrationController(QObject):
 
         if self.config:
             save_orientation(self._orientation, self.config)
+
+        # Orientation-only mode: preserve the previously-loaded motor↔px,
+        # grid pitch, and Z-tilt; skip _compute_calibration_from_scans,
+        # Z-tilt scan, and refinement. Just re-save the (unchanged)
+        # matrices alongside the new orientation and finish.
+        if self._mode == 'orientation_only':
+            print("[OrientCal] Orientation-only mode: keeping prior cal, "
+                  "skipping matrix/Z-tilt/refinement.")
+            self.progress.emit('orient',
+                f'Orientation-only: kept prior cal, orientation={self._orientation}.')
+            QTimer.singleShot(50, self._finalize)
+            return
 
         # Now compute calibration from scan data
         QTimer.singleShot(200, self._compute_calibration_from_scans)

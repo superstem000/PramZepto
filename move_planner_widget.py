@@ -183,6 +183,7 @@ class MovePlannerWidget(QWidget):
         self._waiting_for_cal = False       # dwell expired, holding for cal
         self._cal_prep_moving = False       # planner-driven move to SAFE_CENTER before cal
         self._cal_skip_move_to_center = False  # passed to orient_cal.start()
+        self._cal_mode = 'full'             # 'full' or 'orientation_only'; passed to orient_cal.start()
 
         # Spiral-scan-step hooks. The host screen calls
         # set_spiral_scan_controller() and set_spiral_scan_settings_provider()
@@ -244,6 +245,8 @@ class MovePlannerWidget(QWidget):
             if getattr(s, "run_calibration_during_dwell", False):
                 return True
             if s.step_type == "calibration":
+                return True
+            if s.step_type == "orientation_calibration":
                 return True
             # Legacy microfluidics step expands into MICROFLUIDICS_SEQUENCE
             if s.step_type == "microfluidics":
@@ -330,6 +333,17 @@ class MovePlannerWidget(QWidget):
         self.btn_add_calibration.setStyleSheet("background-color: #9C27B0; color: white; font-weight: bold;")
         self.btn_add_calibration.clicked.connect(self._on_add_calibration)
         type_layout.addWidget(self.btn_add_calibration)
+
+        self.btn_add_orient_cal = QPushButton("Orient Cal")
+        self.btn_add_orient_cal.setMinimumHeight(80)
+        self.btn_add_orient_cal.setStyleSheet("background-color: #009688; color: white; font-weight: bold;")
+        self.btn_add_orient_cal.setToolTip(
+            "Orientation-only re-calibration (~5-8 min, no incubation).\n"
+            "Reuses prior full calibration's motor↔px + Z-tilt; only "
+            "re-detects orientation. Requires a valid prior calibration on disk."
+        )
+        self.btn_add_orient_cal.clicked.connect(self._on_add_orientation_calibration)
+        type_layout.addWidget(self.btn_add_orient_cal)
 
         self.btn_add_push2 = QPushButton("µFluidics Push 2")
         self.btn_add_push2.setMinimumHeight(80)
@@ -613,6 +627,15 @@ class MovePlannerWidget(QWidget):
         self._add_step_to_table(step)
         self._set_status("Added Calibration step.")
 
+    def _on_add_orientation_calibration(self):
+        step = RecipeStep(
+            step_type="orientation_calibration",
+            dwell_ms=0,  # no incubation timer for this variant
+            note="Orient-only cal (~5-8 min, reuses prior full cal)",
+        )
+        self._add_step_to_table(step)
+        self._set_status("Added Orient Cal step.")
+
     def _on_add_spiral_scan(self):
         # Read scan size + cycle count from this widget's own inputs, so each
         # spiral_scan step in a sequence carries its own settings independent
@@ -676,6 +699,12 @@ class MovePlannerWidget(QWidget):
         elif step.step_type == "calibration":
             type_item = QTableWidgetItem("Calibrate")
             type_item.setBackground(Qt.GlobalColor.darkMagenta)
+            for c in (2, 3, 4, 5):
+                self.table.setItem(r, c, QTableWidgetItem("—"))
+            self.table.setItem(r, 6, QTableWidgetItem(str(step.dwell_ms) if step.dwell_ms else ""))
+        elif step.step_type == "orientation_calibration":
+            type_item = QTableWidgetItem("Orient Cal")
+            type_item.setBackground(Qt.GlobalColor.darkCyan)
             for c in (2, 3, 4, 5):
                 self.table.setItem(r, c, QTableWidgetItem("—"))
             self.table.setItem(r, 6, QTableWidgetItem(str(step.dwell_ms) if step.dwell_ms else ""))
@@ -1005,6 +1034,7 @@ class MovePlannerWidget(QWidget):
         self._micro_seq_source = []
         self._cal_prep_moving = False
         self._cal_skip_move_to_center = False
+        self._cal_mode = 'full'
         # Stop any running cal we kicked off during a dwell
         self._cleanup_cal_during_dwell(stop_cal=True)
         # Stop any running spiral scan we kicked off
@@ -1079,6 +1109,7 @@ class MovePlannerWidget(QWidget):
             self._pending_dwell_ms = 0
             self._pending_cal_during_dwell = False
             self._cal_prep_moving = True
+            self._cal_mode = 'full'
             self._override_z_limit()
             try:
                 self.stepper.mc.set_speed_multiplier(1.0)
@@ -1086,6 +1117,33 @@ class MovePlannerWidget(QWidget):
                 pass
             self._set_status(
                 f"Step {self._exec_index + 1}: Moving to calibration center..."
+            )
+            try:
+                self.stepper._preempt_all_motion()
+                self.stepper._all_btn_enabled(False)
+                self.stepper.move_to_ctrl.start(
+                    SAFE_CENTER_X_FS, SAFE_CENTER_Y_FS, 0.0
+                )
+            except Exception as e:
+                self._cal_prep_moving = False
+                self._finish_execution(f"Move to cal center failed: {e}")
+        elif step.step_type == "orientation_calibration":
+            # Same shape as `calibration` step but runs OrientCal in
+            # 'orientation_only' mode: row/col scans → orientation → save.
+            # Skips motor↔px compute, Z-tilt scan, and refinement — assumes
+            # the loaded calibration on disk is still valid. ~5-8 min total,
+            # no incubation timer (dwell=1ms sentinel).
+            self._pending_dwell_ms = 0
+            self._pending_cal_during_dwell = False
+            self._cal_prep_moving = True
+            self._cal_mode = 'orientation_only'
+            self._override_z_limit()
+            try:
+                self.stepper.mc.set_speed_multiplier(1.0)
+            except Exception:
+                pass
+            self._set_status(
+                f"Step {self._exec_index + 1}: Moving to orient-cal center..."
             )
             try:
                 self.stepper._preempt_all_motion()
@@ -1414,18 +1472,26 @@ class MovePlannerWidget(QWidget):
         # Standalone-calibration pre-move to SAFE_CENTER just completed.
         # Hand off to the working cal-during-dwell path but tell OrientCal
         # to skip its own move-to-center (we already drove there).
+        # For full cal: real 30-min incubation timer. For orientation-only:
+        # 1-ms sentinel — advance as soon as cal finishes.
         if self._cal_prep_moving:
             self._cal_prep_moving = False
             self._pending_dwell_ms = 0
             self._pending_cal_during_dwell = True
             self._cal_skip_move_to_center = True
-            self._set_status(
-                f"Step {self._exec_index + 1}: Calibration (30 min incubation)..."
-            )
-            # Real 30-minute incubation timer running in parallel with cal.
-            # If cal finishes early, we still wait the full 30 min. If cal
-            # runs long, _waiting_for_cal holds until it completes.
-            self._start_dwell(30 * 60 * 1000)
+            if self._cal_mode == 'orientation_only':
+                self._set_status(
+                    f"Step {self._exec_index + 1}: Orient-only cal (~5-8 min)..."
+                )
+                self._start_dwell(1)
+            else:
+                self._set_status(
+                    f"Step {self._exec_index + 1}: Calibration (30 min incubation)..."
+                )
+                # Real 30-minute incubation timer running in parallel with cal.
+                # If cal finishes early, we still wait the full 30 min. If cal
+                # runs long, _waiting_for_cal holds until it completes.
+                self._start_dwell(30 * 60 * 1000)
             return
 
         # If in microfluidics sub-sequence, check dwell then advance
@@ -1521,11 +1587,13 @@ class MovePlannerWidget(QWidget):
         # calibration step), tell OrientCal to skip its internal
         # move-to-center and go straight to AF. Cleared after use.
         skip = getattr(self, '_cal_skip_move_to_center', False)
+        mode = getattr(self, '_cal_mode', 'full')
         self._cal_skip_move_to_center = False
+        self._cal_mode = 'full'
         try:
-            self._orient_cal.start(settings, skip_move_to_center=skip)
+            self._orient_cal.start(settings, skip_move_to_center=skip, mode=mode)
             print(f"[Planner] Orientation calibration started "
-                  f"(skip_move_to_center={skip}).")
+                  f"(skip_move_to_center={skip}, mode={mode}).")
         except Exception as e:
             self._cal_running_for_step = False
             print(f"[Planner] Failed to start calibration during dwell: {e}")
