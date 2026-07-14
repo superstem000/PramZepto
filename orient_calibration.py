@@ -406,12 +406,16 @@ class OrientCalibrationController(QObject):
         mode:
           'full' (default) — row/col scans → orientation → motor↔px matrix →
                              Z-tilt scan → refinement cycles. ~30 min.
-          'orientation_only' — row/col scans → orientation → save. Skips the
-                             matrix compute, Z-tilt scan, and refinement.
-                             REQUIRES a prior valid calibration on disk
-                             (the loaded motor↔px / Z-tilt / grid-pitch are
-                             preserved and re-saved with the new orientation).
-                             ~5-8 min.
+          'orientation_only' — row/col scans → orientation → SIGN-CORRECT
+                             the loaded motor↔px / grid-pitch from the mini-
+                             scan's observed (Δmotor ↔ Δcanonical-id) signs,
+                             then save. Stored MAGNITUDES are preserved (they
+                             were fit from many samples in the prior full
+                             cal); only per-element signs are updated to
+                             match the current plate mounting. Z-tilt is
+                             untouched. Aborts if observed pitch magnitude
+                             differs from stored by > 30% — a real hardware
+                             change needs full cal. ~60-90 sec.
 
         If skip_move_to_center=True, the caller guarantees the stage is
         already at (SAFE_CENTER_X_FS, SAFE_CENTER_Y_FS, 0). We skip the
@@ -815,20 +819,215 @@ class OrientCalibrationController(QObject):
         if self.config:
             save_orientation(self._orientation, self.config)
 
-        # Orientation-only mode: preserve the previously-loaded motor↔px,
-        # grid pitch, and Z-tilt; skip _compute_calibration_from_scans,
-        # Z-tilt scan, and refinement. Just re-save the (unchanged)
-        # matrices alongside the new orientation and finish.
+        # Orientation-only mode: preserve stored MAGNITUDES of the prior cal
+        # (motor↔px, grid pitch, Z-tilt) but correct SIGNS from the mini-scan
+        # data. A prior full cal that was done on a differently-mounted plate
+        # can leave motor↔px signs stale even when the magnitudes are right;
+        # the walk then goes the opposite direction it should. Sign
+        # correction fixes that without paying the full-cal time cost. Z-tilt
+        # is left untouched (it's a physical property of the stage, not the
+        # plate).
         if self._mode == 'orientation_only':
-            print("[OrientCal] Orientation-only mode: keeping prior cal, "
-                  "skipping matrix/Z-tilt/refinement.")
+            ok = self._sign_correct_from_scans()
+            if not ok:
+                self.stop("Sign correction failed — pitch magnitudes disagree "
+                          "with stored calibration (>30% off). Hardware likely "
+                          "changed; run full calibration.")
+                return
             self.progress.emit('orient',
-                f'Orientation-only: kept prior cal, orientation={self._orientation}.')
+                f'Orientation-only: signs corrected, orientation={self._orientation}.')
             QTimer.singleShot(50, self._finalize)
             return
 
         # Now compute calibration from scan data
         QTimer.singleShot(200, self._compute_calibration_from_scans)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Orientation-only sign correction
+    # ═══════════════════════════════════════════════════════════════
+
+    # Below this observed magnitude (fs), a fitted grid_pitch component is
+    # treated as too small to reliably determine sign — we keep whatever
+    # sign the stored cal has for that element. The dominant components
+    # in the row/col scans are ~10-16 fs, so 0.5 is well below signal.
+    _SIGN_NOISE_FS = 0.5
+    # If the observed dominant pitch magnitude differs from the stored one
+    # by more than this fraction, assume hardware changed (different chip
+    # geometry, camera moved, etc.) and refuse — the user has to run a full
+    # calibration.
+    _MAG_SANITY_TOL = 0.30
+
+    def _sign_correct_from_scans(self) -> bool:
+        """Correct signs of stored grid_pitch_*_fs and motor_to_px using the
+        mini-scan's observed (Δmotor, Δcanonical_id) relationships.
+
+        Preserves the stored magnitudes (which were fit from many samples
+        in the prior full cal) — only per-element signs are updated to
+        match the current physical mounting. motor_to_px is then re-solved
+        so grid_pitch_*_px (physical marker layout, unchanged) stays
+        consistent with the new grid_pitch_*_fs.
+
+        Returns False if data is insufficient or the observed pitch magnitude
+        disagrees with stored by > _MAG_SANITY_TOL (likely a hardware change
+        that this fast path can't safely handle).
+        """
+        if not self.result.valid:
+            print("[OrientCal] Sign-correct: no prior cal loaded, cannot proceed.")
+            return False
+
+        # Apply orientation correction to the raw scan frames + best-marker
+        # summaries so all IDs are in canonical (col, row) space.
+        for frame_data in self._row_scan_frames:
+            correct_marker_ids(frame_data['markers'], self._orientation)
+        for frame_data in self._col_scan_frames:
+            correct_marker_ids(frame_data['markers'], self._orientation)
+
+        def _correct_summary(summary):
+            if summary is None:
+                return None
+            c, r = summary['col_id'], summary['row_id']
+            s = dict(summary)
+            if self._orientation == "h_flip":
+                s['col_id'], s['row_id'] = _BITREV5[c], _BITREV5[r]
+            elif self._orientation == "v_flip":
+                s['col_id'], s['row_id'] = r, c
+            elif self._orientation == "180":
+                s['col_id'], s['row_id'] = _BITREV5[r], _BITREV5[c]
+            return s
+
+        row_data = [_correct_summary(d) for d in self._row_scan_data]
+        col_data = [_correct_summary(d) for d in self._col_scan_data]
+
+        # Collect (motor_delta, dcol, drow) samples across both scan directions.
+        # Convention (matches the walk formula in _compute_move_delta):
+        #   motor_delta = -grid_pitch_col_fs * dcol - grid_pitch_row_fs * drow
+        # so fitting form is Ax = b with x = [col_fs_x, col_fs_y, row_fs_x, row_fs_y].
+        samples = []
+        for i in range(len(self._row_motor_deltas)):
+            a, b = row_data[i], row_data[i + 1] if i + 1 < len(row_data) else None
+            if a is None or b is None:
+                continue
+            samples.append((self._row_motor_deltas[i],
+                            b['col_id'] - a['col_id'],
+                            b['row_id'] - a['row_id']))
+        for i in range(len(self._col_motor_deltas)):
+            a, b = col_data[i], col_data[i + 1] if i + 1 < len(col_data) else None
+            if a is None or b is None:
+                continue
+            samples.append((self._col_motor_deltas[i],
+                            b['col_id'] - a['col_id'],
+                            b['row_id'] - a['row_id']))
+
+        if len(samples) < 2:
+            print(f"[OrientCal] Sign-correct: only {len(samples)} valid sample(s), "
+                  f"need >= 2. Keeping stored cal unchanged.")
+            return True
+
+        A = np.zeros((2 * len(samples), 4))
+        b_vec = np.zeros(2 * len(samples))
+        for i, (mot, dc, dr) in enumerate(samples):
+            # X row: -dc * col_fs_x + -dr * row_fs_x = mot[0]
+            A[2 * i, 0] = -dc
+            A[2 * i, 2] = -dr
+            b_vec[2 * i] = mot[0]
+            # Y row: -dc * col_fs_y + -dr * row_fs_y = mot[1]
+            A[2 * i + 1, 1] = -dc
+            A[2 * i + 1, 3] = -dr
+            b_vec[2 * i + 1] = mot[1]
+
+        try:
+            fit, *_ = np.linalg.lstsq(A, b_vec, rcond=None)
+        except Exception as e:
+            print(f"[OrientCal] Sign-correct fit failed: {e}. Keeping stored cal.")
+            return True
+
+        obs_col_fs = np.array([fit[0], fit[1]])
+        obs_row_fs = np.array([fit[2], fit[3]])
+        st_col_fs = np.array(self.result.grid_pitch_col_fs, dtype=float)
+        st_row_fs = np.array(self.result.grid_pitch_row_fs, dtype=float)
+
+        print(f"[OrientCal] Sign-correct fit from {len(samples)} samples:")
+        print(f"  col_fs obs=({obs_col_fs[0]:+.3f}, {obs_col_fs[1]:+.3f})  "
+              f"stored=({st_col_fs[0]:+.3f}, {st_col_fs[1]:+.3f})")
+        print(f"  row_fs obs=({obs_row_fs[0]:+.3f}, {obs_row_fs[1]:+.3f})  "
+              f"stored=({st_row_fs[0]:+.3f}, {st_row_fs[1]:+.3f})")
+
+        # Sanity check magnitudes on the dominant (largest-abs) component of each pitch.
+        obs_col_mag = float(np.max(np.abs(obs_col_fs)))
+        obs_row_mag = float(np.max(np.abs(obs_row_fs)))
+        st_col_mag = float(np.max(np.abs(st_col_fs)))
+        st_row_mag = float(np.max(np.abs(st_row_fs)))
+
+        def _mag_ok(obs, stored, label):
+            if stored < 1e-6:
+                print(f"[OrientCal] Sign-correct: stored {label} pitch is zero.")
+                return False
+            err = abs(obs - stored) / stored
+            if err > self._MAG_SANITY_TOL:
+                print(f"[OrientCal] Sign-correct: {label} magnitude mismatch — "
+                      f"obs {obs:.2f}fs vs stored {stored:.2f}fs "
+                      f"(err {err*100:.0f}% > {self._MAG_SANITY_TOL*100:.0f}%).")
+                return False
+            return True
+
+        if not _mag_ok(obs_col_mag, st_col_mag, 'col') or \
+           not _mag_ok(obs_row_mag, st_row_mag, 'row'):
+            return False
+
+        # Per-element sign correction. If the observed component is too small
+        # to trust (below _SIGN_NOISE_FS), keep the stored sign.
+        def _fixed(stored, obs):
+            if abs(obs) < self._SIGN_NOISE_FS:
+                return float(stored)
+            if stored == 0:
+                return float(obs)
+            return float(stored) if np.sign(obs) == np.sign(stored) else -float(stored)
+
+        new_col_fs = np.array([_fixed(st_col_fs[0], obs_col_fs[0]),
+                                _fixed(st_col_fs[1], obs_col_fs[1])])
+        new_row_fs = np.array([_fixed(st_row_fs[0], obs_row_fs[0]),
+                                _fixed(st_row_fs[1], obs_row_fs[1])])
+
+        flips = []
+        for name, old, new in [('col_fs[x]', st_col_fs[0], new_col_fs[0]),
+                                ('col_fs[y]', st_col_fs[1], new_col_fs[1]),
+                                ('row_fs[x]', st_row_fs[0], new_row_fs[0]),
+                                ('row_fs[y]', st_row_fs[1], new_row_fs[1])]:
+            if old != new:
+                flips.append(f"{name} {old:+.3f}→{new:+.3f}")
+
+        if not flips:
+            print("[OrientCal] Sign-correct: signs already match observation.")
+            return True
+        print(f"[OrientCal] Sign-correct: flipping {len(flips)} component(s): "
+              f"{'; '.join(flips)}")
+
+        # Recompute motor_to_px so the invariant grid_pitch_*_px = motor_to_px @ grid_pitch_*_fs
+        # holds with the sign-corrected fs values. grid_pitch_*_px is a
+        # physical plate-marker layout that spiral_scan measures fresh each
+        # step when possible; the stored value stays valid for the current
+        # geometry, so we solve motor_to_px from those and the new fs values:
+        #   [col_px, row_px] = motor_to_px @ [col_fs, row_fs]
+        Fs_mat = np.column_stack([new_col_fs, new_row_fs])
+        Px_mat = np.column_stack([self.result.grid_pitch_col_px,
+                                   self.result.grid_pitch_row_px])
+        try:
+            new_motor_to_px = Px_mat @ np.linalg.inv(Fs_mat)
+            new_px_to_motor = np.linalg.inv(new_motor_to_px)
+        except np.linalg.LinAlgError as e:
+            print(f"[OrientCal] Sign-correct: matrix inverse failed ({e}). "
+                  f"Aborting sign correction.")
+            return False
+
+        self.result.grid_pitch_col_fs = new_col_fs
+        self.result.grid_pitch_row_fs = new_row_fs
+        self.result.motor_to_px = new_motor_to_px
+        self.result.px_to_motor = new_px_to_motor
+
+        m = self.result.motor_to_px
+        print(f"[OrientCal] Sign-correct: new motor→px  "
+              f"+X→({m[0,0]:+.3f}, {m[1,0]:+.3f})  +Y→({m[0,1]:+.3f}, {m[1,1]:+.3f})")
+        return True
 
     # ═══════════════════════════════════════════════════════════════
     # Phase 3: Compute calibration from scan data
