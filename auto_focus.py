@@ -111,7 +111,7 @@ SEARCH_PROFILES = {
 # Calibration full AF: replaces stage 1 with a wide sweep from Z=100 to Z=200
 # (center=150, range=±50, step=1.5), then runs the same finer stages as
 # the regular SEARCH_PROFILES for mres=32.
-CALIBRATION_AF_STAGE1_CENTER_FS = 175.0
+CALIBRATION_AF_STAGE1_CENTER_FS = 150.0
 CALIBRATION_AF_STAGE1_RANGE_FS  = 25.0    # ± from center -> 100..200
 CALIBRATION_AF_STAGE1_STEP_FS   = 0.5
 

@@ -92,7 +92,7 @@ MICROFLUIDICS_PUSH2 = [
     RecipeStep(step_type="move", x_us=21000, y_us=36986, z_us=22589,
                speed=0.02, override_z_limit=True),
     # Slow push
-    RecipeStep(step_type="move", x_us=10677, y_us=36986, z_us=22589,
+    RecipeStep(step_type="move", x_us=16677, y_us=36986, z_us=22589,
                speed=0.02, override_z_limit=True),
     # Fast retract to safe park position (previously followed by an optional
     # 20-min settle then a full Z retract — keeping the retract-to-park to
