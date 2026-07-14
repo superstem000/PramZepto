@@ -1612,10 +1612,17 @@ class MovePlannerWidget(QWidget):
             self._waiting_for_cal = True
             # Status hint, but we don't touch the countdown label format —
             # remaining time has reached zero, so this just sits at 00:00.
-            self._set_status(
-                f"Step {self._exec_index + 1}: dwell complete, "
-                f"waiting for calibration to finish..."
-            )
+            if self._cal_mode == 'orientation_only':
+                # Dwell here is a 1-ms sentinel; the real work is the cal
+                # itself. Say so instead of "dwell complete, waiting…".
+                self._set_status(
+                    f"Step {self._exec_index + 1}: Orient-only cal running..."
+                )
+            else:
+                self._set_status(
+                    f"Step {self._exec_index + 1}: dwell complete, "
+                    f"waiting for calibration to finish..."
+                )
             return
         self._advance_after_dwell()
 

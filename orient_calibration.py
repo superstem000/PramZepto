@@ -614,12 +614,27 @@ class OrientCalibrationController(QObject):
         self._phase = 'initial_af'
         if self.af_controller:
             if self._mode == 'orientation_only':
-                # Orientation-only: quick AF (a few positions around the last
-                # known focus). Marker decoding tolerates loose focus, and the
-                # full calibration AF's 101-position wide sweep is overkill
-                # here. Cuts ~30-60s off the initial AF phase.
-                self.progress.emit('af', 'Quick AF (orient-only)...')
-                self.af_controller.start_quick(self._camera_settings)
+                # Orientation-only: quick AF centered on the previously-known
+                # focus (KNOWN_FOCUS_FULLSTEP, ~170 fs), not current Z.
+                # After the pre-move, Z is at 0 (SAFE_CENTER), which is
+                # nowhere near focus — sweeping ±0.6 around 0 finds nothing
+                # and reference-capture then fails detection.
+                #
+                # Wider ±3 fs sweep gives tolerance for focus drift between
+                # runs, while still finishing in ~10-15 s (30 positions at
+                # 0.2 fs step). Marker decoding tolerates loose focus.
+                try:
+                    from auto_focus import KNOWN_FOCUS_FULLSTEP
+                    focus_center = float(KNOWN_FOCUS_FULLSTEP)
+                except Exception:
+                    focus_center = 170.0
+                self.progress.emit('af',
+                    f'Quick AF (orient-only) around Z={focus_center:.1f}fs...')
+                self.af_controller.start_quick(
+                    self._camera_settings,
+                    custom_range=3.0,
+                    center_z=focus_center,
+                )
             else:
                 # Wide-sweep calibration AF: stage 1 sweeps Z=100..200 at
                 # 1.5fs, subsequent stages refine, and the final best Z is
