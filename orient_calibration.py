@@ -432,12 +432,14 @@ class OrientCalibrationController(QObject):
 
         self._mode = mode
         # Orientation-only mode: shrink the forward-scan count from
-        # SCAN_STEPS=10 to 2 per direction. Combined with skip-reverse-pass
-        # (in _scan_capture_and_advance) and skip-per-step-AF (in
-        # _do_quick_af), total time drops from ~5-8 min to ~30-60 sec.
-        # analyze_orientation only needs ~3 valid samples per direction to
-        # score reliably; forward 2 + initial center = 3.
-        self._orient_scan_steps = 2 if mode == 'orientation_only' else SCAN_STEPS
+        # SCAN_STEPS=10 to 3 per direction. Combined with FULL-tile step
+        # size (2× half-tile, applied in _scan_capture_and_advance),
+        # skip-reverse-pass, and skip-per-step-AF, total time drops from
+        # ~5-8 min to ~60-90 sec while giving 3 guaranteed boundary
+        # crossings per direction — enough for the analyzer to reliably
+        # distinguish 'normal' from 'h_flip' (which would tie on a single
+        # monotonic diff).
+        self._orient_scan_steps = 3 if mode == 'orientation_only' else SCAN_STEPS
         self._active = True
         self._stop_requested = False
         self._af_kickoff_pending = False
@@ -755,6 +757,13 @@ class OrientCalibrationController(QObject):
 
         delta_fs = (self._half_tile_row_fs() if direction == 'row'
                     else self._half_tile_col_fs())
+        # Orientation-only mode: double the step to a full tile so each move
+        # is GUARANTEED to cross a marker boundary. Half-tile moves cross a
+        # boundary only ~50% of the time, which leaves the analyzer with too
+        # few non-zero marker-ID transitions to distinguish 'normal' from
+        # 'h_flip' — both score identically on a single monotonic diff.
+        if self._mode == 'orientation_only':
+            delta_fs = delta_fs * 2.0
         self._phase = f'{direction}_scan_move'
         self.move_to_ctrl.start(self._cur_x() + delta_fs[0],
                                  self._cur_y() + delta_fs[1],
