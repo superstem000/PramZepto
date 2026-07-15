@@ -3,7 +3,7 @@
     "name": "microfluidics test",
     "steps": [
       {
-        "step_type": "microfluidics",
+        "step_type": "orientation_calibration",
         "x_us": 0,
         "y_us": 0,
         "z_us": 0,
@@ -13,7 +13,20 @@
         "run_calibration_during_dwell": false,
         "num_cycles": 1,
         "scan_size": 5,
-        "note": "Microfluidics routine"
+        "note": "Orient-only cal (~1 min, reuses prior full cal)"
+      },
+      {
+        "step_type": "spiral_scan",
+        "x_us": 0,
+        "y_us": 0,
+        "z_us": 0,
+        "speed": 1.0,
+        "dwell_ms": 0,
+        "override_z_limit": false,
+        "run_calibration_during_dwell": false,
+        "num_cycles": 1,
+        "scan_size": 5,
+        "note": "Spiral scan (5\u00d75, 1 cycle)"
       }
     ]
   },
