@@ -1625,8 +1625,8 @@ class OrientCalibrationController(QObject):
         # Normal scan settings — match what the real scan will use
         self._z_scan.SCAN_SIZE = 8
         self._z_scan._scan_size = 8
-        self._z_scan._center_col = 7 #15
-        self._z_scan._center_row = 22 #15
+        self._z_scan._center_col = 15 #15
+        self._z_scan._center_row = 15 #15
         # AF_EVERY_N_TILES = 2 (default)
         # LEARN_RATE = 0.02 (default)
         # BASE_AF_RANGE = 0.4 (default)
